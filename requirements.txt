@@ -1,0 +1,4 @@
+chia_rs>=0.17.0
+chia-puzzles-py>=0.20.0
+mnemonic>=0.21
+requests>=2.32.0
