@@ -11,12 +11,12 @@ The protocol is described in [chip-silent-payments.md](chip-silent-payments.md).
 ## Requirements
 
 - Python 3.10+
-- [coinset](https://github.com/AbandonedFactory/coinset) CLI (for on-chain lookups)
+- [coinset](https://github.com/coinset-org/cli) CLI (for on-chain lookups)
 - [Sage](https://github.com/xch-dev/sage) wallet (optional, for sending transactions via RPC)
 
 ### Installing coinset
 
-`coinset` is a command-line tool for querying the Chia blockchain. Install it following the instructions at https://github.com/AbandonedFactory/coinset. It must be available in your PATH.
+`coinset` is a command-line tool for querying the Chia blockchain. Install it following the instructions at https://github.com/coinset-org/cli. It must be available in your PATH.
 
 ### Installing Python dependencies
 
