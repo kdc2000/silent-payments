@@ -2,6 +2,8 @@
 
 A prototype implementing [BIP-352](https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki)-style silent payments for the Chia blockchain. Recipients publish a single static address; senders use ECDH to derive unique, unlinkable one-time addresses per payment. No interaction is required, and the resulting transactions are indistinguishable from normal Chia spends.
 
+See the draft proposal [CHIP-0057](https://github.com/Chia-Network/chips/blob/448fdc4b690b985c4ccc8bcf38480494124d4fa8/CHIPs/chip-0057.md).
+
 **This is a prototype for testnet use only. Do not use with real funds.**
 
 The protocol is described in [chip-silent-payments.md](chip-silent-payments.md).
