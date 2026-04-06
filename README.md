@@ -6,8 +6,6 @@ See the draft proposal [CHIP-0057](https://github.com/Chia-Network/chips/blob/44
 
 **This is a prototype for testnet use only. Do not use with real funds.**
 
-The protocol is described in [chip-silent-payments.md](chip-silent-payments.md).
-
 ## Requirements
 
 - Python 3.10+
