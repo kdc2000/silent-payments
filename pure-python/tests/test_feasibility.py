@@ -3,7 +3,8 @@ CAT2/NFT1 silent payment feasibility tests.
 
 Validates that the sender's synthetic public key can be extracted from
 CAT2 and NFT1 puzzle structures by recursively uncurrying puzzle layers.
-Covers requirements EXT-01 (CAT2) and EXT-02 (NFT1).
+Wrapped puzzles are outside version 0 of the protocol (see "Future Extensions");
+the standard-puzzle extractor in shared.py deliberately rejects them.
 """
 
 from chia_rs import G1Element, PrivateKey, Program
@@ -212,7 +213,7 @@ def build_nft_puzzle(inner_puzzle: Program, with_ownership: bool) -> Program:
 
 
 def test_cat2_mod_identification():
-    """EXT-01: Verify that a CAT2 puzzle's MOD can be identified by hash.
+    """Verify that a CAT2 puzzle's MOD can be identified by hash.
 
     Builds a CAT2 puzzle, uncurries it, converts the MOD LazyNode back
     to a Program, and asserts its tree-hash equals CAT_PUZZLE_HASH.
@@ -232,7 +233,7 @@ def test_cat2_mod_identification():
 
 
 def test_cat2_pk_extraction():
-    """EXT-01: Extract synthetic PK from a CAT2 puzzle wrapping standard p2.
+    """Extract synthetic PK from a CAT2 puzzle wrapping standard p2.
 
     Builds a CAT2 puzzle around a known p2 inner puzzle and verifies
     that extract_pk_from_puzzle() peels the CAT layer and returns the
@@ -253,7 +254,7 @@ def test_cat2_pk_extraction():
 
 
 def test_nft1_4layer_pk_extraction():
-    """EXT-02: Extract synthetic PK from a 4-layer NFT puzzle.
+    """Extract synthetic PK from a 4-layer NFT puzzle.
 
     Builds singleton -> state -> ownership -> p2 and verifies that
     extract_pk_from_puzzle() peels all four layers to reach the
@@ -275,7 +276,7 @@ def test_nft1_4layer_pk_extraction():
 
 
 def test_nft1_3layer_pk_extraction():
-    """EXT-02: Extract synthetic PK from a 3-layer NFT puzzle (no ownership).
+    """Extract synthetic PK from a 3-layer NFT puzzle (no ownership).
 
     Builds singleton -> state -> p2 (skipping ownership layer) and
     verifies PK extraction still works correctly.
@@ -296,7 +297,7 @@ def test_nft1_3layer_pk_extraction():
 
 
 def test_nft1_layer_detection():
-    """EXT-02: Verify that extract_pk_from_puzzle correctly detects
+    """Verify that extract_pk_from_puzzle correctly detects
     both 3-layer and 4-layer NFT variants.
 
     Builds both variants with the same inner p2 puzzle and asserts

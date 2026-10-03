@@ -4,80 +4,59 @@ Check if a coin belongs to a silent payment recipient.
 
 Given the recipient's mnemonic and a coin ID, this program:
 1. Looks up the coin on-chain via coinset
-2. Extracts the sender's synthetic public key from the parent coin's puzzle
-3. Performs scanner-side ECDH: b_scan * (input_hash * A)
-4. Derives the expected one-time puzzle hash using spend key separation
-5. Compares it to the coin's actual puzzle hash
+2. Marshals the SPENT (parent) coin as the lone CoinSpend and the target coin as
+   an addition (preserving the parent-coin input-hash asymmetry)
+3. Routes detection through the SDK block path
+   (sdk_adapter.tweak_data_from_block_spends + scan_from_tweaks) — the SDK owns
+   the synthetic-pk extraction, the ECDH, and the puzzle-hash derivation
+4. Reports MATCH iff the SDK returns a detection whose coin id is the target coin
 
-If they match, the coin belongs to the recipient and can be spent with
-the derived one-time secret key.
+Detection uses the scan secret key and the spend PUBLIC key only. On a match the
+script prints the output index k, the label, and the detection's tweak
+((t_k + label_scalar) mod r) — never a secret key. spend_coin.py combines that
+tweak with the spend secret key to spend the coin.
+
+Keys come from the mnemonic with the hardened derivation CHIP-0057 requires.
+--legacy-keys switches to the unhardened derivation and applies ONLY to a coin paid
+to an address generated before the CHIP's hardened-derivation revision; it must
+never be used for a new address.
+
+This script is single-input-only BY DESIGN: it feeds a one-element block
+(``coin_spends=[parent_CoinSpend]``, ``additions=[target_coin]``) and the
+NON-aggregated sender key. Multi-input / block-range detection is scanner.py.
 
 Usage:
     python scan_coin.py <coin_id_hex> -f keyfile.txt
     python scan_coin.py <coin_id_hex> [recipient_mnemonic]
+    python scan_coin.py <coin_id_hex> -f keyfile.txt --legacy-keys
 """
 
 import sys
-import json
-import hashlib
 import argparse
-import subprocess
 
-from chia_rs import G1Element, Program
-from shared import (
-    mnemonic_to_master_sk, master_sk_to_scan_sk, master_sk_to_spend_sk,
-    compute_input_hash, derive_output_tweak,
-    derive_onetime_pk_full, derive_onetime_sk_full,
-    puzzle_hash_for_pk, calculate_synthetic_secret_key,
-    extract_synthetic_pk, scalar_mult_g1,
-    load_mnemonic,
-)
+import shared
+from shared import load_mnemonic
+
+import sdk_adapter
+import coinset
 
 parser = argparse.ArgumentParser(description="Check if a coin belongs to a silent payment recipient")
 parser.add_argument("coin_id", help="Coin ID hex to check")
 parser.add_argument("mnemonic_words", nargs="*", help="Recipient mnemonic words")
 parser.add_argument("-f", "--mnemonic-file", help="File containing recipient mnemonic")
+parser.add_argument(
+    "--legacy-keys",
+    action="store_true",
+    help="Derive the recipient keys with the UNHARDENED paths "
+    "(m/12381/8444/12/0, m/12381/8444/13/0). Only for coins paid to an address "
+    "generated before CHIP-0057 required hardened derivation; never use it for "
+    "a new address",
+)
 
 
-def coinset_call(command: str, arg: str) -> dict:
-    coin_id = arg if arg.startswith("0x") else "0x" + arg
-    result = subprocess.run(
-        ["coinset", "-t", "-r", command, coin_id],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"coinset error: {result.stderr.strip()}")
-    return json.loads(result.stdout)
-
-
-def get_coin_record(coin_id: str) -> dict:
-    result = coinset_call("get_coin_record_by_name", coin_id)
-    if not result.get("success"):
-        raise RuntimeError(f"Could not find coin: {result}")
-    return result["coin_record"]
-
-
-def get_puzzle_and_solution(coin_id: str) -> dict:
-    result = coinset_call("get_puzzle_and_solution", coin_id)
-    if not result.get("success"):
-        raise RuntimeError(f"Could not get puzzle/solution: {result}")
-    return result["coin_solution"]
-
-
-def extract_sender_synthetic_pk(coin_record: dict) -> G1Element | None:
-    """Extract the sender's synthetic PK from the parent coin's puzzle reveal."""
-    parent_id = coin_record["coin"]["parent_coin_info"]
-    if parent_id.startswith("0x"):
-        parent_id = parent_id[2:]
-
-    parent_record = get_coin_record(parent_id)
-    if not parent_record.get("spent"):
-        raise RuntimeError("Parent coin is not spent — cannot extract puzzle")
-
-    parent_spend = get_puzzle_and_solution(parent_id)
-
-    puzzle = Program.from_bytes(bytes.fromhex(parent_spend["puzzle_reveal"][2:]))
-    return extract_synthetic_pk(puzzle)
+def _strip(h: str) -> str:
+    """Strip a leading ``0x`` from a coinset hex field."""
+    return h[2:] if h.startswith("0x") else h
 
 
 def main():
@@ -94,70 +73,77 @@ def main():
     else:
         mnemonic = load_mnemonic([], prompt="Enter recipient mnemonic: ")
 
-    # Derive recipient scan and spend keys
-    master_sk = mnemonic_to_master_sk(mnemonic)
-    scan_sk = master_sk_to_scan_sk(master_sk)
-    scan_pk = scan_sk.get_g1()
-    spend_sk = master_sk_to_spend_sk(master_sk)
-    spend_pk = spend_sk.get_g1()
+    # Derive recipient scan and spend keys via the adapter (no direct SDK import,
+    # no shared scan-crypto — all BLS math stays on the SDK side of the FFI).
+    if args.legacy_keys:
+        print(sdk_adapter.LEGACY_KEYS_WARNING, file=sys.stderr)
+        keys = sdk_adapter.legacy_unhardened_keys_from_mnemonic(mnemonic)
+    else:
+        keys = sdk_adapter.keys_from_mnemonic(mnemonic)
 
-    print(f"Scan pubkey:  {bytes(scan_pk).hex()}")
-    print(f"Spend pubkey: {bytes(spend_pk).hex()}")
+    print(f"Scan pubkey:  {keys.scan_pk().to_bytes().hex()}")
+    print(f"Spend pubkey: {keys.spend_pk().to_bytes().hex()}")
     print(f"Checking coin: {coin_id}")
     print()
 
-    # Look up the coin
-    coin_record = get_coin_record(coin_id)
-    coin_ph = coin_record["coin"]["puzzle_hash"]
-    if coin_ph.startswith("0x"):
-        coin_ph = coin_ph[2:]
+    # Look up the target coin.
+    target_rec = coinset.get_coin_record(coin_id)
+    target_coin = target_rec["coin"]
+    coin_ph = _strip(target_coin["puzzle_hash"])
 
     print(f"Coin puzzle hash: {coin_ph}")
-    print(f"Coin amount:      {coin_record['coin']['amount']} mojos")
+    print(f"Coin amount:      {target_coin['amount']} mojos")
     print()
 
-    # Extract sender's synthetic public key from the parent coin's puzzle
-    print("Extracting sender synthetic public key from parent puzzle...")
-    sender_synthetic_pk = extract_sender_synthetic_pk(coin_record)
-
-    if sender_synthetic_pk is None:
-        print("Could not extract synthetic public key. Parent coin may not use a standard puzzle.")
+    # The SPENT (parent) coin carries the sender's standard puzzle reveal; the SDK
+    # extracts the synthetic pk from it and computes the input_hash over the PARENT
+    # coin id (the parent-coin asymmetry). Fetch BOTH the puzzle reveal AND the
+    # solution (the SDK runs the puzzle to extract any opcode-64 edges; a single
+    # coin has none, but the SDK still parses).
+    parent_id = _strip(target_coin["parent_coin_info"])
+    parent_rec = coinset.get_coin_record(parent_id)
+    if not parent_rec.get("spent"):
+        print("Parent coin is not spent — cannot extract puzzle")
         sys.exit(1)
 
-    print(f"Sender synthetic pk: {bytes(sender_synthetic_pk).hex()}")
+    pspend = coinset.get_puzzle_and_solution(parent_id)
 
-    # Scanner-side ECDH: b_scan * (input_hash * A)
-    # Use the PARENT coin's ID as the coin_ids list for input_hash,
-    # because the sender used their spent coin's ID (the parent) when
-    # computing the ECDH. The output coin didn't exist yet at send time.
-    parent_id = coin_record["coin"]["parent_coin_info"]
-    if parent_id.startswith("0x"):
-        parent_id = parent_id[2:]
-    coin_ids = [bytes.fromhex(parent_id)]
-    input_hash = compute_input_hash(coin_ids, sender_synthetic_pk)
+    # Marshal the one-element block: parent as the CoinSpend, target as the addition.
+    coin_spends = [
+        sdk_adapter.coin_spend_from_record(
+            parent_rec, pspend["puzzle_reveal"], pspend["solution"]
+        )
+    ]
+    additions = [sdk_adapter.coin_from_addition(target_rec)]
 
-    input_hash_times_A = scalar_mult_g1(input_hash, sender_synthetic_pk)
-    scan_scalar = int.from_bytes(bytes(scan_sk), "big")
-    ecdh_point = scalar_mult_g1(scan_scalar, input_hash_times_A)
-    shared_secret = hashlib.sha256(bytes(ecdh_point)).digest()
+    # SDK block path: extract tweak data, then scan with the scan SECRET key and
+    # the spend PUBLIC key (the spend secret key is not needed to detect). The
+    # change label m=0 is always checked by the SDK. For a single coin a raise IS
+    # a legitimate "could not process" error — let it propagate; do NOT swallow
+    # it.
+    td = sdk_adapter.tweak_data_from_block_spends(coin_spends, additions)
+    dets = sdk_adapter.scan_from_tweaks(
+        keys.scan_sk(),
+        keys.spend_pk(),
+        td,
+        sdk_adapter.label_registry(keys.scan_sk(), []),
+        shared.K_MAX,
+    )
 
-    tweak = derive_output_tweak(shared_secret, 0)
-    onetime_pk = derive_onetime_pk_full(spend_pk, tweak)
-    expected_ph = puzzle_hash_for_pk(onetime_pk)
+    match = next((d for d in dets if bytes(d.coin_id) == bytes.fromhex(coin_id)), None)
 
-    print(f"Expected PH:         {expected_ph.hex()}")
-    print()
-
-    if expected_ph.hex() == coin_ph:
+    if match is not None:
         print("MATCH! This coin belongs to you.")
         print()
-
-        # Derive the one-time secret key for spending (uses spend key)
-        onetime_sk = derive_onetime_sk_full(spend_sk, tweak)
-        synthetic_sk = calculate_synthetic_secret_key(onetime_sk)
-        print(f"One-time secret key (for spending): {bytes(onetime_sk).hex()}")
-        print(f"One-time public key:                {bytes(onetime_pk).hex()}")
-        print(f"Synthetic secret key:               {bytes(synthetic_sk).hex()}")
+        record = sdk_adapter.detections_to_records([match])[0]
+        label = record["label"]
+        label_str = "none" if label is None else ("0 (change)" if label == 0 else str(label))
+        print(f"One-time puzzle hash: {record['puzzle_hash']}")
+        print(f"Output index k:       {record['k']}")
+        print(f"Label:                {label_str}")
+        # The spend handoff: (t_k + label_scalar) mod r. Not a secret key — the
+        # one-time key is (spend_sk + tweak) mod r, derived by spend_coin.py.
+        print(f"Tweak:                {record['tweak']}")
     else:
         print("NO MATCH. This coin does not belong to you.")
 

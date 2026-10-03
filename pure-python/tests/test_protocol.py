@@ -1,9 +1,10 @@
 """
 Tests for BIP-352 protocol extensions adapted for Chia BLS12-381.
 
-Covers: PROTO-01 (multi-output), PROTO-02 (input hash), PROTO-03 (scan/spend separation),
-PROTO-04 (labeled sub-addresses), PROTO-05 (label unlinkability), PROTO-06 (change detection),
-plus foundational crypto primitives (tagged hash, G1 negation/subtraction).
+Covers: multi-output payments, the input hash, scan/spend key separation,
+labeled sub-addresses, label unlinkability, change detection, address
+encoding and multi-input key aggregation, plus foundational crypto
+primitives (tagged hash, G1 negation/subtraction).
 """
 
 import hashlib
@@ -37,6 +38,7 @@ from shared import (
     subtract_g1,
     tagged_hash,
 )
+from tests.common import output_coin
 
 
 # Fixed test mnemonic (BIP-39 "abandon" x 11 + "about")
@@ -115,11 +117,11 @@ def test_scan_spend_key_separation():
     assert bytes(scan_sk) != bytes(spend_sk)
 
 
-# --- Input Hash Tests (PROTO-02) ---
+# --- Input Hash Tests ---
 
 
 def test_input_hash_prevents_reuse():
-    """PROTO-02: Same sender+recipient with different coin IDs produce different shared secrets."""
+    """Same sender+recipient with different coin IDs produce different shared secrets."""
     sender_sk = PrivateKey.from_seed(bytes([2] * 32))
     sender_pk = sender_sk.get_g1()
 
@@ -151,11 +153,11 @@ def test_output_tweak_range():
     assert 0 <= result < GROUP_ORDER
 
 
-# --- Scan/Spend Separation Tests (PROTO-03) ---
+# --- Scan/Spend Separation Tests ---
 
 
 def test_scan_spend_separation():
-    """PROTO-03: Scan key detects, spend key derives spending secret."""
+    """Scan key detects, spend key derives spending secret."""
     # Recipient keys
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     scan_sk = master_sk_to_scan_sk(master)
@@ -215,11 +217,11 @@ def test_ecdh_commutativity():
     assert ss_sender == ss_scanner
 
 
-# --- Multi-Output Tests (PROTO-01) ---
+# --- Multi-Output Tests ---
 
 
 def test_multi_output_different_recipients():
-    """PROTO-01: Two recipients get distinct one-time puzzle hashes from single sender."""
+    """Two recipients get distinct one-time puzzle hashes from single sender."""
     # Sender
     sender_sk = PrivateKey.from_seed(bytes([2] * 32))
 
@@ -252,7 +254,7 @@ def test_multi_output_different_recipients():
 
 
 def test_multi_output_same_recipient():
-    """PROTO-01: Two outputs to same recipient get different puzzle hashes (counter k)."""
+    """Two outputs to same recipient get different puzzle hashes (counter k)."""
     sender_sk = PrivateKey.from_seed(bytes([2] * 32))
 
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
@@ -270,11 +272,11 @@ def test_multi_output_same_recipient():
     assert outputs[0][1] != outputs[1][1]
 
 
-# --- Labeled Sub-Address Tests (PROTO-04) ---
+# --- Labeled Sub-Address Tests ---
 
 
 def test_labeled_subaddress():
-    """PROTO-04: Labeled sub-address generation and detection."""
+    """Labeled sub-address generation and detection."""
     # Recipient keys
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     scan_sk = master_sk_to_scan_sk(master)
@@ -300,7 +302,7 @@ def test_labeled_subaddress():
 
     # Scan for the payment
     detected = scan_for_silent_payment(
-        scan_sk, spend_pk, sender_pk, coin_ids, [outputs[0][1]], labels=labels_dict
+        scan_sk, spend_pk, sender_pk, coin_ids, [output_coin(outputs[0][1])], labels=labels_dict
     )
 
     assert len(detected) == 1
@@ -309,11 +311,11 @@ def test_labeled_subaddress():
     assert detected[0]["puzzle_hash"] == outputs[0][1]
 
 
-# --- Label Unlinkability Tests (PROTO-05) ---
+# --- Label Unlinkability Tests ---
 
 
 def test_label_unlinkability():
-    """PROTO-05: Observer cannot distinguish labeled from unlabeled outputs."""
+    """Observer cannot distinguish labeled from unlabeled outputs."""
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     scan_sk = master_sk_to_scan_sk(master)
     scan_pk = scan_sk.get_g1()
@@ -349,11 +351,11 @@ def test_label_unlinkability():
     assert unlabeled_ph != labeled_ph  # different values but same format
 
 
-# --- Change Detection Tests (PROTO-06) ---
+# --- Change Detection Tests ---
 
 
 def test_change_detection():
-    """PROTO-06: Sender identifies change output via label m=0."""
+    """Sender identifies change output via label m=0."""
     # Recipient keys (sender is also recipient for change)
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     scan_sk = master_sk_to_scan_sk(master)
@@ -379,7 +381,7 @@ def test_change_detection():
 
     # Scan for change output
     detected = scan_for_silent_payment(
-        scan_sk, spend_pk, sender_pk, coin_ids, [outputs[0][1]], labels=labels_dict
+        scan_sk, spend_pk, sender_pk, coin_ids, [output_coin(outputs[0][1])], labels=labels_dict
     )
 
     assert len(detected) == 1
@@ -415,14 +417,17 @@ def test_end_to_end_send_scan_spend():
 
     # Scanner detects payment (using scan_sk, not spend_sk)
     detected = scan_for_silent_payment(
-        scan_sk, spend_pk, sender_pk, coin_ids, [puzzle_hash]
+        scan_sk, spend_pk, sender_pk, coin_ids, [output_coin(puzzle_hash)]
     )
     assert len(detected) == 1
     assert detected[0]["puzzle_hash"] == puzzle_hash
     assert detected[0]["label"] is None
 
+    # The detection carries the tweak, not a secret key
+    assert not any(isinstance(v, PrivateKey) for v in detected[0].values())
+
     # Recipient derives spending key (requires spend_sk)
-    tweak = detected[0]["tweak"]
+    tweak = detected[0]["spend_tweak"]
     onetime_sk = derive_onetime_sk_full(spend_sk, tweak)
 
     # Verify key pair consistency
@@ -458,14 +463,14 @@ def test_end_to_end_labeled_payment():
     # Scanner detects with labels
     labels_dict = {bytes(label_pk): 5}
     detected = scan_for_silent_payment(
-        scan_sk, spend_pk, sender_pk, coin_ids, [puzzle_hash],
+        scan_sk, spend_pk, sender_pk, coin_ids, [output_coin(puzzle_hash)],
         labels=labels_dict,
     )
     assert len(detected) == 1
     assert detected[0]["label"] == 5
 
     # Recipient derives spending key for labeled output
-    tweak = detected[0]["tweak"]
+    tweak = detected[0]["t_k"]
     onetime_sk_base = derive_onetime_sk_full(spend_sk, tweak)
     # For labeled output: onetime_sk = base_sk + label_scalar
     labeled_onetime_scalar = (
@@ -477,6 +482,9 @@ def test_end_to_end_labeled_payment():
 
     # Verify key pair consistency
     assert labeled_onetime_sk.get_g1() == detected[0]["onetime_pk"]
+
+    # The combined spend tweak gives the same key in one step
+    assert derive_onetime_sk_full(spend_sk, detected[0]["spend_tweak"]) == labeled_onetime_sk
 
 
 # --- Silent Payment Address Encoding Tests ---
@@ -573,11 +581,11 @@ def test_silent_payment_address_payload_length():
     assert len(recovered_spend) == 48
 
 
-# --- Multi-Input Key Aggregation Tests (INPUT-01, INPUT-02) ---
+# --- Multi-Input Key Aggregation Tests ---
 
 
 def test_multi_input_sender_aggregation():
-    """INPUT-01: aggregate_sender_sks sums synthetic SKs mod GROUP_ORDER."""
+    """aggregate_sender_sks sums synthetic SKs mod GROUP_ORDER."""
     sk1 = PrivateKey.from_seed(bytes([10] * 32))
     sk2 = PrivateKey.from_seed(bytes([20] * 32))
     syn_sk1 = calculate_synthetic_secret_key(sk1)
@@ -591,7 +599,7 @@ def test_multi_input_sender_aggregation():
 
 
 def test_multi_input_key_consistency():
-    """INPUT-01: scalar sum's PK == point sum of individual PKs."""
+    """scalar sum's PK == point sum of individual PKs."""
     sk1 = PrivateKey.from_seed(bytes([10] * 32))
     sk2 = PrivateKey.from_seed(bytes([20] * 32))
     syn_sk1 = calculate_synthetic_secret_key(sk1)
@@ -604,7 +612,7 @@ def test_multi_input_key_consistency():
 
 
 def test_multi_input_zero_sum_sender():
-    """INPUT-01: aggregate_sender_sks raises ValueError when sum == 0."""
+    """aggregate_sender_sks raises ValueError when sum == 0."""
     # Construct two keys that sum to zero mod GROUP_ORDER.
     # sk1 = 1, sk2 = GROUP_ORDER - 1 (so sum = GROUP_ORDER = 0 mod r)
     sk1 = PrivateKey.from_bytes((1).to_bytes(32, "big"))
@@ -614,7 +622,7 @@ def test_multi_input_zero_sum_sender():
 
 
 def test_multi_input_zero_sum_scanner():
-    """INPUT-02: aggregate_sender_pks returns identity when PKs cancel out."""
+    """aggregate_sender_pks returns identity when PKs cancel out."""
     sk = PrivateKey.from_seed(bytes([30] * 32))
     pk = sk.get_g1()
     neg_pk = negate_g1(pk)
@@ -623,7 +631,7 @@ def test_multi_input_zero_sum_scanner():
 
 
 def test_multi_input_scanner_aggregation():
-    """INPUT-02: aggregate_sender_pks sums G1 points correctly."""
+    """aggregate_sender_pks sums G1 points correctly."""
     sk1 = PrivateKey.from_seed(bytes([10] * 32))
     sk2 = PrivateKey.from_seed(bytes([20] * 32))
     pk1 = sk1.get_g1()
@@ -632,7 +640,7 @@ def test_multi_input_scanner_aggregation():
 
 
 def test_multi_input_ecdh_commutativity():
-    """INPUT-01 + INPUT-02: sender ECDH with agg_sk matches scanner ECDH with agg_pk."""
+    """sender ECDH with agg_sk matches scanner ECDH with agg_pk."""
     # Two sender wallet keys -> synthetic keys
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     wallet_sk_0 = master_sk_to_wallet_sk(master, 0)
@@ -673,15 +681,15 @@ def test_multi_input_ecdh_commutativity():
     puzzle_hash = puzzle_hash_for_pk(onetime_pk)
 
     detected = scan_for_silent_payment(
-        scan_sk, spend_pk, agg_pk, [coin_id_0, coin_id_1], [puzzle_hash]
+        scan_sk, spend_pk, agg_pk, [coin_id_0, coin_id_1], [output_coin(puzzle_hash)]
     )
     assert len(detected) == 1
     assert detected[0]["puzzle_hash"] == puzzle_hash
 
 
 def test_multi_input_backward_compat():
-    """INPUT-01: create_silent_payment_outputs with single PrivateKey still works."""
-    # This test verifies backward compatibility -- single SK still accepted
+    """create_silent_payment_outputs with single PrivateKey still works."""
+    # A single SK (the aggregated key a_sum) is still accepted
     sender_sk = PrivateKey.from_seed(bytes([2] * 32))
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     scan_pk = master_sk_to_scan_sk(master).get_g1()
@@ -696,7 +704,7 @@ def test_multi_input_backward_compat():
 
 
 def test_multi_input_create_outputs_list():
-    """INPUT-01: create_silent_payment_outputs with list[PrivateKey] matches manual aggregation."""
+    """create_silent_payment_outputs with list[PrivateKey] matches manual aggregation."""
     master = mnemonic_to_master_sk(TEST_MNEMONIC)
     wallet_sk_0 = master_sk_to_wallet_sk(master, 0)
     wallet_sk_1 = master_sk_to_wallet_sk(master, 1)

@@ -1,0 +1,16 @@
+[package]
+name = "sp-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chia-bls = "0.41"
+chia-puzzle-types = "0.41"
+clvm-utils = "0.41"
+sha2 = "0.10"
+bip39 = "2.2"
+num-bigint = "0.4"
+hex = "0.4"
+
+[dev-dependencies]
+chia-puzzles = "0.20"

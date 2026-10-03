@@ -1,0 +1,28 @@
+[package]
+name = "sp-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp-common = { path = "../sp-common" }
+sp-service = { path = "../sp-service" }
+chia-bls = "0.41"
+tokio-tungstenite = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "sp-client"
+path = "src/bin/sp_client.rs"
+
+[dev-dependencies]
+tempfile = "3"

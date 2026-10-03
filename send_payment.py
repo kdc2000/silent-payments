@@ -3,16 +3,24 @@
 Derive the one-time address for a silent payment on Chia testnet11.
 
 Takes the recipient's silent payment address (tspxch1...) plus the sender's
-mnemonic (or Sage wallet via --sage). Uses the sender's wallet key with
-input-hash-augmented ECDH to derive a unique one-time address. The recipient
-detects the payment by extracting the sender's public key from the parent
-coin's on-chain puzzle reveal.
+mnemonic (or Sage wallet via --sage). The send bundle is built ENTIRELY through
+``sdk_adapter`` (the sole ``chia_wallet_sdk`` importer): the SDK derives the
+one-time puzzle hash via input-hash-augmented ECDH, emits the CREATE_COIN /
+change / fee, and (for N>=2 inputs) the cyclic ASSERT_CONCURRENT_SPEND binding.
+The recipient detects the payment by extracting the sender's public key from the
+parent coin's on-chain puzzle reveal.
 
 Multi-input support: when --sage is used and a single coin doesn't cover the
-payment amount, multiple coins are automatically selected and their synthetic
-secret keys are aggregated (a_sum = a_1 + a_2 + ... + a_n). The scanner
-detects these payments by summing the synthetic public keys from each coin's
-puzzle reveal (multi-input scanning, Pass 2).
+payment amount plus fee, the largest coins are selected until it is covered
+(``select_coins``). The coins may sit at different wallet derivation indices: the
+SDK aggregates the synthetic secret keys internally for the ECDH and binds all
+inputs with the cyclic opcode-64 ASSERT_CONCURRENT_SPEND condition, which is what
+a scanner groups on (CHIP-0057 "Scanning a Block", Pass 2).
+
+Broadcast: the built wire dict is pushed via ``coinset push_tx`` by default, or
+via the Sage RPC (``--sage``). Both consume the SAME wire dict (the adapter's
+``sdk_bundle_to_wire_dict`` output). On-chain confirmation is verified manually
+(your own mnemonic + live testnet11).
 
 Usage:
     python send_payment.py <silent_payment_address> -f keyfile.txt
@@ -24,22 +32,75 @@ Usage:
 import sys
 import argparse
 
-from chia_rs import G1Element, Coin, CoinSpend, SpendBundle, AugSchemeMPL, Program
-import json
-import subprocess
+import sdk_adapter
+import coinset
 
 from shared import (
-    mnemonic_to_master_sk, master_sk_to_wallet_sk,
-    calculate_synthetic_secret_key,
-    aggregate_sender_sks,
-    compute_input_hash, compute_shared_secret_full,
-    derive_output_tweak, derive_onetime_pk_full,
-    puzzle_for_pk, puzzle_hash_for_pk, puzzle_hash_to_address,
-    decode_silent_payment_address,
+    puzzle_hash_to_address,
     load_mnemonic,
     compute_coin_id,
-    TESTNET11_GENESIS,
 )
+
+
+def build_coin_spend_conditions(
+    coin_index: int,
+    sage_coins: list,
+    primary_outputs: list,
+) -> list:
+    """Build the conditions list emitted by the i-th input coin.
+
+    For coin_index == 0: ``primary_outputs`` + (if N >= 2) one opcode-64
+    condition pointing at ``sage_coins[N - 1]["coin_id"]`` (closes the cycle).
+    For coin_index > 0: ``[]`` + (if N >= 2) one opcode-64 condition pointing
+    at ``sage_coins[coin_index - 1]["coin_id"]``.
+
+    The cyclic ASSERT_CONCURRENT_SPEND pattern matches Sage's
+    chia-wallet-sdk ``Relation::AssertConcurrent`` byte-for-byte: for N input
+    coins, every coin emits exactly one ``[64, predecessor_coin_id]`` with
+    coin 0 wrapping to coin N-1. See CHIP-0057 "Scanning a Block" (Pass 2 groups
+    the spends of such a cycle).
+
+    This helper is intentionally pure (no I/O, no subprocess) so the emission can
+    be unit-tested without mocking Sage RPC. The SDK owns this binding on the live
+    build path (``sdk_adapter.build_silent_payment_send`` ->
+    ``Relation.AssertConcurrent``); this helper is retained as a topology
+    reference the scanner round-trip tests pin against.
+    """
+    N = len(sage_coins)
+    conditions = list(primary_outputs) if coin_index == 0 else []
+    if N >= 2:
+        if coin_index == 0:
+            prev_coin_id = sage_coins[N - 1]["coin_id"]
+        else:
+            prev_coin_id = sage_coins[coin_index - 1]["coin_id"]
+        conditions.append([64, prev_coin_id])  # ASSERT_CONCURRENT_SPEND
+    return conditions
+
+
+def select_coins(coin_infos: list, needed: int):
+    """Pick the coins to spend: largest first, until ``needed`` mojos are covered.
+
+    ``coin_infos`` is a list of dicts with at least ``amount`` (int) and
+    ``coin_id`` (bytes). The order is deterministic: by amount, largest first, and
+    by coin ID (ascending) among coins of equal amount. Returns the selected
+    coins in that order, or ``None`` if all coins together do not cover
+    ``needed``. With ``needed == 0`` the single largest coin is returned.
+
+    The selection ignores wallet derivation indices. A scanner groups the inputs
+    of a multi-input payment by their ASSERT_CONCURRENT_SPEND cycle (CHIP-0057
+    "Scanning a Block", Pass 2), which the SDK emits for any set of two or more
+    coins, so coins at different indices are detected like coins at one index.
+    """
+    ordered = sorted(coin_infos, key=lambda ci: (-ci["amount"], ci["coin_id"]))
+    selected = []
+    total = 0
+    for ci in ordered:
+        selected.append(ci)
+        total += ci["amount"]
+        if total >= needed:
+            return selected
+    return None
+
 
 parser = argparse.ArgumentParser(description="Derive one-time address for a silent payment")
 parser.add_argument("address", help="Recipient silent payment address (tspxch1...)")
@@ -61,6 +122,25 @@ def strip_0x(h: str) -> str:
 def main():
     args = parser.parse_args()
     sp_address = args.address
+
+    # Validate the recipient address before any wallet or chain lookup. The SDK
+    # decoder enforces the CHIP-0057 format (version, payload length, both keys
+    # valid non-identity G1 points); this script transacts on testnet11 only, so a
+    # mainnet (spxch) address is rejected as well.
+    try:
+        is_testnet = sdk_adapter.silent_payment_address_is_testnet(sp_address)
+    except ValueError as exc:
+        print(f"Invalid silent payment address: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not is_testnet:
+        print(
+            "This script sends on testnet11: expected a tspxch1... address, "
+            "got a mainnet (spxch1...) address.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sage = None
 
     if args.sage:
         # --- Sage RPC flow (supports multi-input) ---
@@ -93,14 +173,14 @@ def main():
         sage.login(fingerprint)
         secret_resp = sage.get_secret_key(fingerprint)
         mnemonic = secret_resp["secrets"]["mnemonic"]
-        master_sk = mnemonic_to_master_sk(mnemonic)
 
-        # Build derivation index -> puzzle hash lookup (try indices 0..99)
+        # Build derivation index -> puzzle hash lookup (try indices 0..99).
+        # The wallet-key derivation routes through the adapter so the script
+        # stays SDK-free and carries no send-crypto.
         MAX_DERIVATION = 100
         ph_to_index = {}
         for i in range(MAX_DERIVATION):
-            wsk = master_sk_to_wallet_sk(master_sk, index=i)
-            ph = puzzle_hash_for_pk(wsk.get_g1())
+            ph = sdk_adapter.wallet_puzzle_hash(mnemonic, i)
             ph_to_index[ph] = i
 
         # Get spendable coins (sorted by amount descending)
@@ -114,17 +194,10 @@ def main():
         all_coin_infos = []
         for sage_coin in coins:
             cid_hex = strip_0x(sage_coin["coin_id"])
-            result = subprocess.run(
-                ["coinset", "-t", "-r", "get_coin_record_by_name",
-                 "0x" + cid_hex],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
+            rec = coinset.get_coin_record(cid_hex, optional=True)
+            if rec is None:
                 continue
-            resp = json.loads(result.stdout)
-            if not resp.get("success"):
-                continue
-            coin_data = resp["coin_record"]["coin"]
+            coin_data = rec["coin"]
             parent = bytes.fromhex(strip_0x(coin_data["parent_coin_info"]))
             ph = bytes.fromhex(strip_0x(coin_data["puzzle_hash"]))
             amt = coin_data["amount"]
@@ -144,74 +217,23 @@ def main():
             print("No spendable coins with known derivation index.", file=sys.stderr)
             sys.exit(1)
 
-        # Select coins: prefer same derivation index so the scanner's
-        # puzzle-hash grouping heuristic can detect multi-input payments.
-        # Try each index group (largest coins first within group), pick the
-        # first group that covers the needed amount.
+        # Select coins: largest first until the amount plus fee is covered. The
+        # derivation index plays no part: the SDK binds any set of two or more
+        # inputs with the ASSERT_CONCURRENT_SPEND cycle the scanner groups on.
         needed = (args.amount or 0) + args.fee
-        from collections import defaultdict
-        index_groups = defaultdict(list)
-        for ci in all_coin_infos:
-            index_groups[ci["derivation_index"]].append(ci)
-
-        selected = None
-        for idx in sorted(index_groups.keys()):
-            group = sorted(index_groups[idx], key=lambda c: c["amount"], reverse=True)
-            candidate = []
-            total = 0
-            for ci in group:
-                candidate.append(ci)
-                total += ci["amount"]
-                if total >= needed:
-                    break
-            if total >= needed:
-                selected = candidate
-                break
-
-        # Fallback: if no single index group suffices, use largest coins
-        # across all indices (scanner may not detect via Pass 2)
+        selected = select_coins(all_coin_infos, needed)
         if selected is None:
-            selected = []
-            total_selected = 0
-            for ci in all_coin_infos:
-                selected.append(ci)
-                total_selected += ci["amount"]
-                if total_selected >= needed:
-                    break
-            if needed > 0 and total_selected < needed:
-                print(f"Insufficient funds: have {total_selected} mojos across "
-                      f"{len(all_coin_infos)} coins, need {needed}.", file=sys.stderr)
-                sys.exit(1)
-            if len(set(ci["derivation_index"] for ci in selected)) > 1:
-                print("Warning: coins span multiple derivation indices. "
-                      "Scanner may not detect this multi-input payment.",
-                      file=sys.stderr)
+            total_available = sum(ci["amount"] for ci in all_coin_infos)
+            print(f"Insufficient funds: have {total_available} mojos across "
+                  f"{len(all_coin_infos)} coins, need {needed}.", file=sys.stderr)
+            sys.exit(1)
 
         # If no --amount, just use the first coin for address derivation
         if not args.amount:
             selected = [all_coin_infos[0]]
 
-        # Derive synthetic SK for each selected coin
-        sender_sks = []
-        wallet_sks = []
-        for ci in selected:
-            wsk = master_sk_to_wallet_sk(master_sk, index=ci["derivation_index"])
-            ssk = calculate_synthetic_secret_key(wsk)
-            sender_sks.append(ssk)
-            wallet_sks.append(wsk)
-
-        # Aggregate keys for multi-input or use single key
-        if len(sender_sks) == 1:
-            sender_sk = sender_sks[0]
-            sender_pk = sender_sk.get_g1()
-            multi_input = False
-        else:
-            sender_sk = aggregate_sender_sks(sender_sks)
-            sender_pk = sender_sk.get_g1()
-            multi_input = True
-
-        coin_ids = [ci["coin_id"] for ci in selected]
         sage_coins = selected
+        multi_input = len(selected) > 1
     else:
         # --- Backward-compatible mnemonic flow (single-input only) ---
         if args.mnemonic_file:
@@ -221,22 +243,12 @@ def main():
         else:
             mnemonic = load_mnemonic([], prompt="Enter sender mnemonic: ")
 
-        master_sk = mnemonic_to_master_sk(mnemonic)
-        wallet_sk = master_sk_to_wallet_sk(master_sk, index=0)
-        sender_sk = calculate_synthetic_secret_key(wallet_sk)
-        sender_pk = sender_sk.get_g1()
-
-        sender_puzzle_hash = puzzle_hash_for_pk(wallet_sk.get_g1())
-        result = subprocess.run(
-            ["coinset", "-t", "-r", "get_coin_records_by_puzzle_hash",
-             "0x" + sender_puzzle_hash.hex()],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            coin_records = json.loads(result.stdout).get("coin_records", [])
-            unspent = [cr for cr in coin_records if not cr.get("spent", False)]
-        else:
-            unspent = []
+        # Index-0 wallet puzzle hash (via the adapter, no send-crypto in-script).
+        sender_puzzle_hash = sdk_adapter.wallet_puzzle_hash(mnemonic, 0)
+        recs = coinset.get_coin_records_by_puzzle_hash(
+            "0x" + sender_puzzle_hash.hex(), optional=True
+        ) or []
+        unspent = [cr for cr in recs if not cr.get("spent", False)]
 
         if len(unspent) == 1:
             cr = unspent[0]["coin"]
@@ -244,8 +256,14 @@ def main():
             ph = bytes.fromhex(strip_0x(cr["puzzle_hash"]))
             amount = cr["amount"]
             coin_id = compute_coin_id(parent, ph, amount)
-            coin_ids = [coin_id]
             print(f"Using coin: {coin_id.hex()} ({amount} mojos)", file=sys.stderr)
+            selected = [{
+                "coin_id": coin_id,
+                "parent_coin_info": parent,
+                "puzzle_hash": ph,
+                "amount": amount,
+                "derivation_index": 0,
+            }]
         elif len(unspent) > 1:
             print(f"Multiple unspent coins ({len(unspent)}) at derivation index 0.", file=sys.stderr)
             print("Use --sage for multi-input wallets.", file=sys.stderr)
@@ -255,101 +273,95 @@ def main():
             print("Use --sage or fund the wallet first.", file=sys.stderr)
             sys.exit(1)
 
-        sage_coins = None
-        wallet_sks = [wallet_sk]
-        sender_sks = [sender_sk]
+        sage_coins = selected
         multi_input = False
 
-    # Parse recipient keys from silent payment address
-    scan_pk_bytes, spend_pk_bytes = decode_silent_payment_address(sp_address)
-    scan_pk = G1Element.from_bytes(scan_pk_bytes)
-    spend_pk = G1Element.from_bytes(spend_pk_bytes)
-
-    # Compute one-time output
-    input_hash = compute_input_hash(coin_ids, sender_pk)
-    shared_secret = compute_shared_secret_full(sender_sk, scan_pk, input_hash)
-    tweak = derive_output_tweak(shared_secret, 0)
-    onetime_pk = derive_onetime_pk_full(spend_pk, tweak)
-    onetime_puzzle_hash = puzzle_hash_for_pk(onetime_pk)
-    address = puzzle_hash_to_address(onetime_puzzle_hash)
+    coin_ids = [ci["coin_id"] for ci in selected]
 
     print()
-    print("=== Silent Payment Address ===")
+    print("=== Silent Payment ===")
+
+    # --sage requires --amount to broadcast; the mnemonic flow always resolved a
+    # single coin above and broadcasts via coinset.push_tx.
+    if args.sage and not args.amount:
+        print(f"Selected coin: {selected[0]['coin_id'].hex()} "
+              f"({selected[0]['amount']} mojos, index {selected[0]['derivation_index']})")
+        print()
+        print("Use --amount N to submit via Sage, or send manually to the recipient address.")
+        return
+
+    # Resolve the send amount + fee and the insufficient-funds CHECK (the SDK
+    # owns the actual change arithmetic; this is the display + guard only).
+    payment_amount = args.amount if args.amount else selected[0]["amount"] - args.fee
+    fee = args.fee
+    total_value = sum(ci["amount"] for ci in selected)
+    change_amount = total_value - payment_amount - fee
+    if change_amount < 0:
+        print(f"Insufficient funds: have {total_value} mojos, "
+              f"need {payment_amount + fee}.", file=sys.stderr)
+        sys.exit(1)
+
+    # Build per-input keys + the send bundle via the adapter (SDK owns ECDH /
+    # CREATE_COIN / change / fee / cyclic opcode-64 binding).
+    inputs = []
+    synthetic_secret_keys = []
+    for ci in selected:
+        wallet_pk, wallet_sk, synthetic_sk = sdk_adapter.wallet_keys(
+            mnemonic, ci["derivation_index"]
+        )
+        inputs.append({
+            "parent_coin_info": ci["parent_coin_info"],
+            "puzzle_hash": ci["puzzle_hash"],
+            "amount": ci["amount"],
+            "wallet_pk": wallet_pk,
+            "wallet_sk": wallet_sk,
+        })
+        synthetic_secret_keys.append(synthetic_sk)
+
+    change_ph = sdk_adapter.default_change_puzzle_hash(mnemonic)
+    coin_spends = sdk_adapter.build_silent_payment_send(
+        sp_address, inputs, change_ph, payment_amount, fee
+    )
+
+    # Recover the recipient one-time puzzle hash from the built CREATE_COIN for
+    # display — exactly what lands on-chain.
+    onetime_puzzle_hash = sdk_adapter.recipient_one_time_puzzle_hash(coin_spends, change_ph)
+    address = puzzle_hash_to_address(onetime_puzzle_hash)
+
     print(f"Send to:     {address}")
     print(f"Puzzle hash: {onetime_puzzle_hash.hex()}")
     if multi_input:
         print(f"Mode:        multi-input ({len(coin_ids)} coins)")
     print()
-    if sage_coins:
-        for i, ci in enumerate(sage_coins):
-            print(f"  Coin {i}: {ci['coin_id'].hex()} ({ci['amount']} mojos, "
-                  f"index {ci['derivation_index']})")
-        print()
+    for i, ci in enumerate(sage_coins):
+        print(f"  Coin {i}: {ci['coin_id'].hex()} ({ci['amount']} mojos, "
+              f"index {ci['derivation_index']})")
+    print()
 
-    if args.sage and args.amount:
-        if not sage_coins:
-            print("Bug: sage_coins not set in --sage path.", file=sys.stderr)
-            sys.exit(1)
-
-        payment_amount = args.amount
-        fee = args.fee
-        total_value = sum(ci["amount"] for ci in sage_coins)
-        change_amount = total_value - payment_amount - fee
-
-        # Build a CoinSpend + signature for each input coin
-        coin_spends = []
-        sigs = []
-
-        for i, ci in enumerate(sage_coins):
-            coin_obj = Coin(ci["parent_coin_info"], ci["puzzle_hash"], ci["amount"])
-            coin_puzzle = puzzle_for_pk(wallet_sks[i].get_g1())
-
-            if i == 0:
-                # First coin carries the payment output and change
-                conditions = [
-                    [51, onetime_puzzle_hash, payment_amount],  # CREATE_COIN
-                ]
-                if change_amount > 0:
-                    change_ph = puzzle_hash_for_pk(wallet_sks[0].get_g1())
-                    conditions.append([51, change_ph, change_amount])
-                if fee > 0:
-                    conditions.append([52, fee])  # RESERVE_FEE
-                if len(sage_coins) > 1:
-                    conditions.append([60, b''])  # CREATE_COIN_ANNOUNCEMENT for binding
-            else:
-                # Additional coins assert the first coin's announcement
-                import hashlib as _hl
-                ann_id = _hl.sha256(sage_coins[0]["coin_id"] + b'').digest()
-                conditions = [[61, ann_id]]  # ASSERT_COIN_ANNOUNCEMENT
-
-            delegated_puzzle = Program.to((1, conditions))
-            dp_bytes = bytes(delegated_puzzle)
-            solution = Program.from_bytes_unchecked(
-                b'\xff\x80\xff' + dp_bytes + b'\xff\x80\x80'
-            )
-
-            msg = delegated_puzzle.get_tree_hash() + coin_obj.name() + TESTNET11_GENESIS
-            sig = AugSchemeMPL.sign(sender_sks[i], msg)
-
-            coin_spends.append(CoinSpend(coin_obj, coin_puzzle, solution))
-            sigs.append(sig)
-
-        # Aggregate all signatures
-        agg_sig = AugSchemeMPL.aggregate(sigs)
-        spend_bundle = SpendBundle(coin_spends, agg_sig)
-
-        sage.submit_transaction(spend_bundle.to_json_dict())
-        print(f"Transaction submitted via Sage!")
-        print(f"Sent {payment_amount} mojos to {address}")
-        if multi_input:
-            print(f"Inputs: {len(sage_coins)} coins (multi-input silent payment)")
-        if change_amount > 0:
-            print(f"Change: {change_amount} mojos returned to sender")
-    elif args.sage and not args.amount:
-        print("Use --amount N to submit via Sage, or send manually to the above address.")
+    # Sign + broadcast the SAME wire dict via coinset.push_tx (default) or Sage.
+    bundle = sdk_adapter.build_signed_spend_bundle(coin_spends, synthetic_secret_keys)
+    wire = sdk_adapter.sdk_bundle_to_wire_dict(bundle)
+    if args.sage:
+        sage.submit_transaction(wire)
+        via = "Sage"
     else:
-        print("Send XCH to the above address from your wallet.")
-        print("The recipient detects the payment from the on-chain puzzle reveal.")
+        # coinset.push_tx returns the node's JSON body on a zero exit; a REJECTED
+        # bundle comes back as {"success": false, "error": ...} (the node still
+        # exits 0). Do NOT report success blindly — surface the node's error, or a
+        # bad bundle is "submitted" yet never block-included.
+        resp = coinset.push_tx(wire)
+        if isinstance(resp, dict) and resp.get("success") is False:
+            err = resp.get("error") or resp.get("structuredError") or resp
+            print(f"coinset push_tx REJECTED the transaction: {err}", file=sys.stderr)
+            sys.exit(1)
+        via = "coinset push_tx"
+
+    print(f"Transaction submitted via {via}!")
+    print(f"Sent {payment_amount} mojos to {address}")
+    if multi_input:
+        print(f"Inputs: {len(sage_coins)} coins (multi-input silent payment)")
+    if change_amount > 0:
+        print(f"Change: {change_amount} mojos returned to sender")
 
 
 if __name__ == "__main__":

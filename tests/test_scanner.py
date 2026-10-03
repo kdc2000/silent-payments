@@ -1,8 +1,28 @@
 """
-Tests for blockchain scanner with mocked coinset CLI responses.
+Tests for the SDK-backed blockchain scanner (scanner.py) with mocked coinset CLI.
 
-Covers: SCAN-01 (block-range scanning), SCAN-02 (sender PK extraction from removals),
-SCAN-03 (coin_id + amount + block_height reporting), SCAN-04 (skip non-standard puzzles).
+``scanner.py`` runs on the SDK block path: ``process_block``/``scan_blocks``
+marshal each block's removals/additions through ``sdk_adapter`` and call
+``tweak_data_from_block_spends`` + ``scan_from_tweaks`` (the SDK owns ALL grouping
+— the single concurrent-spend SCC Pass 2 over the opcode-64 directed graph — ECDH,
+one-time derivation, and the pollution defense INTERNALLY).
+
+The mocked coinset dispatcher patches ``coinset.subprocess.run`` (scanner.py does
+not import subprocess — ``coinset.py`` owns the boundary) and feeds per-block
+fixture shapes. The coin marshaling delegates coin-id computation to the SDK
+(``Coin.coin_id()`` == ``make_coin_name`` SHA256), so the per-coin-id
+``get_puzzle_and_solution`` dispatch keys match.
+
+Coverage:
+  * single-input detection (coin_id/amount/block_height reported),
+  * coinbase removals skipped (no puzzle/solution lookup attempted),
+  * non-standard puzzles produce no detection (SDK standard-puzzle-filter skip),
+  * empty range returns [],
+  * multi-input same-derivation-index (concurrent-spend group, A_sum = sp+sp),
+  * multi-input cross-index (opcode-64 concurrent-spend SCC cycle),
+  * directed-SCC pollution defense (the polluter is NOT aggregated),
+  * mixed same-index + cross-index in one block,
+  * sender->scanner round-trip (send_payment.build_coin_spend_conditions output).
 """
 
 import hashlib
@@ -10,21 +30,36 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from chia_rs import G1Element, PrivateKey
+from chia_rs import Program
 
-from shared import (
-    create_silent_payment_outputs,
-    master_sk_to_scan_sk,
-    master_sk_to_spend_sk,
-    master_sk_to_wallet_sk,
-    puzzle_for_pk,
-    calculate_synthetic_public_key,
-    calculate_synthetic_secret_key,
-    aggregate_sender_sks,
-    aggregate_sender_pks,
-    compute_coin_id,
-)
-from scanner import coinset_json, scan_blocks, process_block, strip_0x
+import shared
+import sdk_adapter
+from scanner import scan_blocks, process_block
+
+
+# --- SDK-backed offline output builder ---
+#
+# The fixture builders below synthesize offline silent-payment outputs and sender
+# puzzles through the SDK adapter (compute_input_hash + derive_one_time_puzzle_hash
+# + aggregate_sender_sks/pks, and clvm.standard_spend for the sender puzzle
+# reveal) — the same primitives the SDK send path uses.
+
+
+def create_silent_payment_outputs(sender_sks, coin_ids, recipients):
+    """Build offline silent-payment outputs via the SDK adapter.
+
+    For the single-recipient case this test uses. ``sender_sks`` is a single SDK
+    ``SecretKey`` (synthetic) or a list of them; ``recipients`` is
+    ``[(scan_pk, spend_pk)]``. Returns ``[(None, puzzle_hash_bytes)]`` — only the
+    puzzle hash (index 1) is consumed by the tests.
+    """
+    sks = sender_sks if isinstance(sender_sks, list) else [sender_sks]
+    scan_pk, spend_pk = recipients[0]
+    agg_sk = sdk_adapter.aggregate_sender_sks(sks)
+    agg_pk = sdk_adapter.aggregate_sender_pks([sk.public_key() for sk in sks])
+    input_hash = sdk_adapter.compute_input_hash(list(coin_ids), agg_pk)
+    ph = sdk_adapter.derive_one_time_puzzle_hash(scan_pk, spend_pk, agg_sk, input_hash, 0)
+    return [(None, bytes(ph))]
 
 
 # --- Test helpers ---
@@ -39,10 +74,14 @@ def mock_coinset_response(stdout_dict, returncode=0):
 
 
 def make_coin_name(parent_hex: str, puzzle_hash_hex: str, amount: int) -> bytes:
-    """Compute coin name = SHA256(parent || puzzle_hash || amount)."""
+    """Compute coin name = SHA256(parent || puzzle_hash || amount).
+
+    Chia's variable-length big-endian amount encoding for coin IDs — byte-equal to
+    the SDK's ``Coin.coin_id()``, so the dispatcher's per-coin-id keys match the
+    ids scanner.py derives via ``sdk_adapter.coin_from_addition``.
+    """
     parent = bytes.fromhex(parent_hex)
     ph = bytes.fromhex(puzzle_hash_hex)
-    # Chia uses variable-length big-endian encoding for amounts in coin IDs
     if amount == 0:
         amt_bytes = b"\x00"
     else:
@@ -51,637 +90,807 @@ def make_coin_name(parent_hex: str, puzzle_hash_hex: str, amount: int) -> bytes:
     return hashlib.sha256(parent + ph + amt_bytes).digest()
 
 
-# --- Key fixtures for payment detection test ---
+def _strip_0x(h: str) -> str:
+    return h[2:] if h.startswith("0x") else h
 
-# Sender: derives a wallet key, then the SYNTHETIC key (matches what the scanner extracts)
-_sender_master = PrivateKey.from_seed(bytes([2] * 32))
-_sender_wallet_sk = master_sk_to_wallet_sk(_sender_master, 0)
-_sender_wallet_pk = _sender_wallet_sk.get_g1()
-_sender_sk = calculate_synthetic_secret_key(_sender_wallet_sk)  # synthetic SK used for ECDH
-_sender_pk = _sender_sk.get_g1()  # synthetic PK = what extract_synthetic_pk returns
 
-# Build the sender's standard puzzle (curries synthetic PK)
-_sender_synthetic_pk = calculate_synthetic_public_key(_sender_wallet_pk)
-_sender_puzzle = puzzle_for_pk(_sender_wallet_pk)
-_sender_puzzle_hex = bytes(_sender_puzzle).hex()
+def _empty_labels():
+    """Empty SDK LabelRegistry (unlabeled scan) for the recipient scan key."""
+    return sdk_adapter.label_registry(_scan_sk_sdk, [])
 
-# Recipient: derives scan and spend keys
-_recipient_master = PrivateKey.from_seed(bytes([3] * 32))
-_scan_sk = master_sk_to_scan_sk(_recipient_master)
-_scan_pk = _scan_sk.get_g1()
-_spend_sk = master_sk_to_spend_sk(_recipient_master)
-_spend_pk = _spend_sk.get_g1()
 
-# A fake parent coin for the sender's spent coin
-_fake_parent_info = "aa" * 32
-_sender_puzzle_hash = _sender_puzzle.get_tree_hash().hex()
+def _build_opcode_64_solution(predecessor_coin_id: bytes) -> bytes:
+    """Build a CLVM solution emitting exactly one [64, predecessor_coin_id] condition.
 
-# The sender's spent coin (removal) identity
-_sender_coin_amount = 1_000_000
-_sender_coin_name = make_coin_name(_fake_parent_info, _sender_puzzle_hash, _sender_coin_amount)
+    Mirrors the standard p2_delegated_puzzle_or_hidden_puzzle solution shape:
+    (() delegated_puzzle ()) where delegated_puzzle = (1 . [[64, predecessor]]).
+    """
+    delegated = Program.to((1, [[64, predecessor_coin_id]]))
+    dp_bytes = bytes(delegated)
+    return b"\xff\x80\xff" + dp_bytes + b"\xff\x80\x80"
 
-# Create a valid silent payment output from sender to recipient
-# Uses synthetic SK so sender_pk in ECDH matches what the scanner extracts from puzzle
-_sp_outputs = create_silent_payment_outputs(
-    _sender_sk,
-    [_sender_coin_name],
-    [(_scan_pk, _spend_pk)],
+
+def _create_coin_solution(output_ph: bytes, amount: int, *, also_op64=None) -> bytes:
+    """Standard-spend solution emitting a recipient CREATE_COIN (+ optional op64)."""
+    conds = [[51, output_ph, amount]]
+    if also_op64 is not None:
+        conds.append([64, also_op64])
+    delegated = Program.to((1, conds))
+    return b"\xff\x80\xff" + bytes(delegated) + b"\xff\x80\x80"
+
+
+# --- Key fixtures (recipient TV + deterministic senders) ---
+
+# Recipient: derives scan and spend keys through the SDK (hardened CHIP-0057
+# derivation). The scan path takes the scan SECRET key and the
+# spend PUBLIC key only; the spend secret key is kept for the tests that turn a
+# detection's tweak into the one-time key.
+_RECIPIENT_MNEMONIC = (
+    "abandon abandon abandon abandon abandon abandon "
+    "abandon abandon abandon abandon abandon about"
 )
-_onetime_pk, _output_puzzle_hash = _sp_outputs[0]
+_recipient_keys = sdk_adapter.keys_from_mnemonic(_RECIPIENT_MNEMONIC)
+_scan_sk_sdk = _recipient_keys.scan_sk()
+_spend_sk_sdk = _recipient_keys.spend_sk()
+_scan_pk = _recipient_keys.scan_pk()
+_spend_pk = _recipient_keys.spend_pk()
+_spend_pk_sdk = _spend_pk
 
-# The output coin (addition) has the sender's coin as parent
-_output_amount = 500_000
 
-# --- Multi-input fixtures (INPUT-03) ---
+def _detect(height, removals_block):
+    """Run the SDK-backed process_block with an empty (unlabeled) registry."""
+    return process_block(
+        height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+    )
 
-# Second sender coin: same puzzle hash (same wallet, same derivation index), different parent
-_fake_parent_info_2 = "bb" * 32
-_sender_coin_amount_2 = 2_000_000
-_sender_coin_name_2 = make_coin_name(_fake_parent_info_2, _sender_puzzle_hash, _sender_coin_amount_2)
 
-# Multi-input: aggregate two copies of the same synthetic SK (same derivation index)
-_multi_agg_sk = aggregate_sender_sks([_sender_sk, _sender_sk])
-_multi_agg_pk = _multi_agg_sk.get_g1()
-
-_multi_sp_outputs = create_silent_payment_outputs(
-    [_sender_sk, _sender_sk],
-    [_sender_coin_name, _sender_coin_name_2],
-    [(_scan_pk, _spend_pk)],
+# Senders at distinct derivation indices (fixed mnemonic — never a real wallet).
+# Each carries the SYNTHETIC sk (the ECDH key) + the standard puzzle that curries
+# the synthetic pk (what the SDK extracts on-chain), built via clvm.standard_spend
+# so no shared.py crypto is referenced.
+_SENDER_MNEMONIC = (
+    "legal winner thank year wave sausage worth useful "
+    "legal winner thank yellow"
 )
-_multi_onetime_pk, _multi_output_puzzle_hash = _multi_sp_outputs[0]
-_multi_output_amount = 1_500_000
 
 
-# --- Tests ---
-
-class TestCoinsetJson:
-    """Tests for the coinset_json CLI wrapper."""
-
-    @patch("scanner.subprocess.run")
-    def test_coinset_json_success(self, mock_run):
-        """coinset_json returns parsed JSON dict on success."""
-        expected = {"blockchain_state": {"peak": {"height": 3875000}}}
-        mock_run.return_value = mock_coinset_response(expected)
-
-        result = coinset_json("get_blockchain_state")
-
-        assert result == expected
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args
-        assert "coinset" in call_args[0][0]
-        assert "get_blockchain_state" in call_args[0][0]
-
-    @patch("scanner.subprocess.run")
-    def test_coinset_json_error(self, mock_run):
-        """coinset_json raises RuntimeError on non-zero exit code."""
-        mock_run.return_value = mock_coinset_response({}, returncode=1)
-
-        with pytest.raises(RuntimeError, match="coinset error"):
-            coinset_json("get_blockchain_state")
+def _sender(index: int) -> dict:
+    wallet_pk, _wallet_sk, synthetic_sk = sdk_adapter.wallet_keys(_SENDER_MNEMONIC, index)
+    clvm = sdk_adapter.Clvm()
+    spend = clvm.standard_spend(wallet_pk.derive_synthetic(), clvm.delegated_spend([]))
+    return {
+        "synthetic_sk": synthetic_sk,
+        "puzzle_hex": bytes(spend.puzzle.serialize()).hex(),
+        "puzzle_hash": bytes(spend.puzzle.tree_hash()).hex(),
+    }
 
 
-class TestStripHex:
-    """Tests for hex prefix normalization."""
-
-    def test_hex_normalization(self):
-        """strip_0x handles both prefixed and unprefixed hex consistently."""
-        assert strip_0x("0xabcdef") == "abcdef"
-        assert strip_0x("abcdef") == "abcdef"
-        assert strip_0x("0x") == ""
-        assert strip_0x("") == ""
+_s0 = _sender(0)
+_s1 = _sender(1)
+_s2 = _sender(2)
+_sM = _sender(3)  # polluter
+_s4 = _sender(4)
+_s5 = _sender(5)
 
 
-class TestScanBlocks:
-    """Tests for the main scan_blocks function."""
+# ==========================================================================
+# Single-input detection + the negative/skip paths
+# ==========================================================================
 
-    @patch("scanner.subprocess.run")
+class TestScanBlocksSingleInput:
+
+    @patch("coinset.subprocess.run")
     def test_scan_blocks_finds_payment(self, mock_run):
-        """scan_blocks detects a valid silent payment coin and returns coin_id, amount, block_height."""
+        """scan_blocks detects a single-input silent payment and reports the dict."""
         block_height = 100
+        parent = "aa" * 32
+        amount = 1_000_000
+        coin_name = make_coin_name(parent, _s0["puzzle_hash"], amount)
 
-        # Mock coinset responses for different commands
-        def mock_dispatcher(cmd, **kwargs):
-            command = cmd[3]  # ["coinset", "-t", "-r", <command>, ...]
-
-            if command == "get_block_records":
-                return mock_coinset_response({
-                    "block_records": [
-                        {"height": block_height, "timestamp": 1700000000},
-                    ]
-                })
-            elif command == "get_additions_and_removals":
-                return mock_coinset_response({
-                    "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _output_puzzle_hash.hex(),
-                                "amount": _output_amount,
-                            },
-                            "coinbase": False,
-                        },
-                        # A coinbase addition that should be ignored
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + ("00" * 32),
-                                "puzzle_hash": "0x" + ("ff" * 32),
-                                "amount": 1_750_000_000_000,
-                            },
-                            "coinbase": True,
-                        },
-                    ],
-                    "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount,
-                            },
-                            "coinbase": False,
-                        },
-                    ],
-                })
-            elif command == "get_puzzle_and_solution":
-                return mock_coinset_response({
-                    "coin_solution": {
-                        "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                        "solution": "0x80",
-                    }
-                })
-            else:
-                return mock_coinset_response({})
-
-        mock_run.side_effect = mock_dispatcher
-
-        detections = scan_blocks(_scan_sk, _spend_pk, start_height=100, end_height=100)
-
-        assert len(detections) == 1
-        d = detections[0]
-        assert "coin_id" in d
-        assert "amount" in d
-        assert "block_height" in d
-        assert d["amount"] == _output_amount
-        assert d["block_height"] == block_height
-
-    @patch("scanner.subprocess.run")
-    def test_scan_blocks_skips_nonstandard(self, mock_run):
-        """scan_blocks produces zero detections when extract_synthetic_pk returns None."""
-        block_height = 200
-
-        # A non-standard puzzle that extract_synthetic_pk can't parse
-        nonstandard_puzzle_hex = "ff01ff8080"  # some arbitrary CLVM
+        outputs = create_silent_payment_outputs(
+            _s0["synthetic_sk"], [coin_name], [(_scan_pk, _spend_pk)]
+        )
+        _, output_ph = outputs[0]
+        output_amount = 500_000
+        solution = _create_coin_solution(output_ph, output_amount).hex()
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_block_records":
                 return mock_coinset_response({
-                    "block_records": [
-                        {"height": block_height, "timestamp": 1700000000},
-                    ]
+                    "block_records": [{"height": block_height, "timestamp": 1700000000}]
                 })
             elif command == "get_additions_and_removals":
-                fake_parent = "bb" * 32
-                fake_ph = "cc" * 32
-                removal_coin_name = make_coin_name(fake_parent, fake_ph, 100)
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + removal_coin_name.hex(),
-                                "puzzle_hash": "0x" + ("dd" * 32),
-                                "amount": 50,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + coin_name.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
+                        # coinbase addition that must be ignored
+                        {"coin": {"parent_coin_info": "0x" + ("00" * 32),
+                                  "puzzle_hash": "0x" + ("ff" * 32),
+                                  "amount": 1_750_000_000_000}, "coinbase": True},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + fake_parent,
-                                "puzzle_hash": "0x" + fake_ph,
-                                "amount": 100,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + parent,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount}, "coinbase": False},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
                 return mock_coinset_response({
+                    "success": True,
                     "coin_solution": {
-                        "puzzle_reveal": "0x" + nonstandard_puzzle_hex,
-                        "solution": "0x80",
-                    }
+                        "puzzle_reveal": "0x" + _s0["puzzle_hex"],
+                        "solution": "0x" + solution,
+                    },
                 })
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        detections = scan_blocks(_scan_sk, _spend_pk, start_height=200, end_height=200)
+        detections = scan_blocks(
+            _scan_sk_sdk, _spend_pk_sdk,
+            start_height=100, end_height=100,
+        )
 
-        assert len(detections) == 0
+        assert len(detections) == 1
+        d = detections[0]
+        assert {"coin_id", "amount", "block_height", "puzzle_hash", "k", "label", "tweak"} <= set(d)
+        # A record carries the tweak, never a one-time SECRET key.
+        assert "onetime_sk" not in d
+        assert d["k"] == 0 and d["label"] is None
+        # The tweak + the spend SECRET key give the key that owns the coin.
+        onetime_sk = sdk_adapter.derive_onetime_sk(_spend_sk_sdk, d["tweak"])
+        clvm = sdk_adapter.Clvm()
+        onetime_ph = clvm.standard_spend(
+            onetime_sk.derive_synthetic().public_key(), clvm.delegated_spend([])
+        ).puzzle.tree_hash()
+        assert bytes(onetime_ph).hex() == d["puzzle_hash"]
+        assert d["amount"] == output_amount
+        assert d["block_height"] == block_height
+        assert d["puzzle_hash"] == output_ph.hex()
 
-    @patch("scanner.subprocess.run")
+    @patch("coinset.subprocess.run")
+    def test_scan_blocks_skips_nonstandard(self, mock_run):
+        """A non-standard puzzle reveal yields zero detections (SDK standard-puzzle-filter skip)."""
+        block_height = 200
+        nonstandard_puzzle_hex = "ff01ff8080"
+        fake_parent = "bb" * 32
+        fake_ph = "cc" * 32
+
+        def mock_dispatcher(cmd, **kwargs):
+            command = cmd[3]
+            if command == "get_block_records":
+                return mock_coinset_response({
+                    "block_records": [{"height": block_height, "timestamp": 1700000000}]
+                })
+            elif command == "get_additions_and_removals":
+                removal_coin_name = make_coin_name(fake_parent, fake_ph, 100)
+                return mock_coinset_response({
+                    "additions": [
+                        {"coin": {"parent_coin_info": "0x" + removal_coin_name.hex(),
+                                  "puzzle_hash": "0x" + ("dd" * 32),
+                                  "amount": 50}, "coinbase": False},
+                    ],
+                    "removals": [
+                        {"coin": {"parent_coin_info": "0x" + fake_parent,
+                                  "puzzle_hash": "0x" + fake_ph,
+                                  "amount": 100}, "coinbase": False},
+                    ],
+                })
+            elif command == "get_puzzle_and_solution":
+                return mock_coinset_response({
+                    "success": True,
+                    "coin_solution": {
+                        "puzzle_reveal": "0x" + nonstandard_puzzle_hex,
+                        "solution": "0x80",
+                    },
+                })
+            return mock_coinset_response({})
+
+        mock_run.side_effect = mock_dispatcher
+
+        detections = scan_blocks(
+            _scan_sk_sdk, _spend_pk_sdk,
+            start_height=200, end_height=200,
+        )
+        assert detections == []
+
+    @patch("coinset.subprocess.run")
     def test_scan_blocks_skips_coinbase(self, mock_run):
-        """scan_blocks does not attempt puzzle extraction for coinbase removals."""
+        """Coinbase removals never trigger a puzzle/solution lookup (caller filter)."""
         block_height = 300
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_block_records":
                 return mock_coinset_response({
-                    "block_records": [
-                        {"height": block_height, "timestamp": 1700000000},
-                    ]
+                    "block_records": [{"height": block_height, "timestamp": 1700000000}]
                 })
             elif command == "get_additions_and_removals":
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + ("ab" * 32),
-                                "puzzle_hash": "0x" + ("cd" * 32),
-                                "amount": 100,
-                            },
-                            "coinbase": True,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + ("ab" * 32),
+                                  "puzzle_hash": "0x" + ("cd" * 32),
+                                  "amount": 100}, "coinbase": True},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + ("ef" * 32),
-                                "puzzle_hash": "0x" + ("12" * 32),
-                                "amount": 200,
-                            },
-                            "coinbase": True,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + ("ef" * 32),
+                                  "puzzle_hash": "0x" + ("12" * 32),
+                                  "amount": 200}, "coinbase": True},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
-                # This should NOT be called for coinbase removals
                 raise AssertionError("get_puzzle_and_solution should not be called for coinbase")
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        detections = scan_blocks(_scan_sk, _spend_pk, start_height=300, end_height=300)
+        detections = scan_blocks(
+            _scan_sk_sdk, _spend_pk_sdk,
+            start_height=300, end_height=300,
+        )
+        assert detections == []
 
-        assert len(detections) == 0
-
-    @patch("scanner.subprocess.run")
+    @patch("coinset.subprocess.run")
     def test_scan_blocks_empty_range(self, mock_run):
-        """scan_blocks returns empty list when no transaction blocks exist in range."""
+        """No transaction blocks in range -> empty detections."""
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_block_records":
                 return mock_coinset_response({
                     "block_records": [
-                        # All blocks have timestamp=None (not transaction blocks)
                         {"height": 400, "timestamp": None},
                         {"height": 401, "timestamp": None},
                         {"height": 402, "timestamp": None},
                     ]
                 })
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        detections = scan_blocks(_scan_sk, _spend_pk, start_height=400, end_height=402)
-
+        detections = scan_blocks(
+            _scan_sk_sdk, _spend_pk_sdk,
+            start_height=400, end_height=402,
+        )
         assert detections == []
 
 
 class TestProcessBlock:
-    """Tests for per-block processing."""
 
-    @patch("scanner.subprocess.run")
+    @patch("coinset.subprocess.run")
     def test_process_block_returns_detection_dict(self, mock_run):
-        """process_block returns list of dicts with coin_id, amount, block_height."""
+        """process_block returns dicts with coin_id/amount/block_height (new signature)."""
         block_height = 500
+        parent = "aa" * 32
+        amount = 1_000_000
+        coin_name = make_coin_name(parent, _s0["puzzle_hash"], amount)
+        outputs = create_silent_payment_outputs(
+            _s0["synthetic_sk"], [coin_name], [(_scan_pk, _spend_pk)]
+        )
+        _, output_ph = outputs[0]
+        output_amount = 500_000
+        solution = _create_coin_solution(output_ph, output_amount).hex()
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_additions_and_removals":
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _output_puzzle_hash.hex(),
-                                "amount": _output_amount,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + coin_name.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + parent,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount}, "coinbase": False},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
                 return mock_coinset_response({
+                    "success": True,
                     "coin_solution": {
-                        "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                        "solution": "0x80",
-                    }
+                        "puzzle_reveal": "0x" + _s0["puzzle_hex"],
+                        "solution": "0x" + solution,
+                    },
                 })
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        results = process_block(block_height, _scan_sk, _spend_pk)
-
+        results = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
         assert len(results) == 1
         assert results[0]["block_height"] == block_height
-        assert results[0]["amount"] == _output_amount
+        assert results[0]["amount"] == output_amount
         assert "coin_id" in results[0]
 
 
-class TestScanBlocksMultiInput:
-    """Tests for multi-input detection via puzzle-hash grouping (INPUT-03)."""
+    @patch("coinset.subprocess.run")
+    def test_process_block_reports_both_coins_sharing_one_time_ph(self, mock_run):
+        """CHIP-0057 "Outputs Sharing a Puzzle Hash": one spend creates TWO coins
+        with the same one-time puzzle hash (different amounts); process_block
+        reports both, with the same k and tweak."""
+        block_height = 300
+        parent = "ab" * 32
+        amount = 2_000_000
+        coin_name = make_coin_name(parent, _s0["puzzle_hash"], amount)
 
-    @patch("scanner.subprocess.run")
-    def test_process_block_multi_input_detection(self, mock_run):
-        """Two removals with same puzzle hash are grouped; aggregated-key ECDH detects output."""
+        outputs = create_silent_payment_outputs(
+            _s0["synthetic_sk"], [coin_name], [(_scan_pk, _spend_pk)]
+        )
+        _, output_ph = outputs[0]
+        amounts = (400_000, 600_000)
+        delegated = Program.to((1, [[51, output_ph, a] for a in amounts]))
+        solution = (b"\xff\x80\xff" + bytes(delegated) + b"\xff\x80\x80").hex()
+
+        def mock_dispatcher(cmd, **kwargs):
+            command = cmd[3]
+            if command == "get_additions_and_removals":
+                return mock_coinset_response({
+                    "additions": [
+                        {"coin": {"parent_coin_info": "0x" + coin_name.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": a}, "coinbase": False}
+                        for a in amounts
+                    ],
+                    "removals": [
+                        {"coin": {"parent_coin_info": "0x" + parent,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount}, "coinbase": False},
+                    ],
+                })
+            elif command == "get_puzzle_and_solution":
+                return mock_coinset_response({
+                    "success": True,
+                    "coin_solution": {
+                        "puzzle_reveal": "0x" + _s0["puzzle_hex"],
+                        "solution": "0x" + solution,
+                    },
+                })
+            return mock_coinset_response({})
+
+        mock_run.side_effect = mock_dispatcher
+
+        results = process_block(block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels())
+
+        assert len(results) == 2
+        assert sorted(r["amount"] for r in results) == sorted(amounts)
+        assert len({r["coin_id"] for r in results}) == 2
+        assert {r["puzzle_hash"] for r in results} == {output_ph.hex()}
+        assert {r["k"] for r in results} == {0}
+        assert {r["label"] for r in results} == {None}
+        assert len({r["tweak"] for r in results}) == 1
+        assert {r["parent_coin_id"] for r in results} == {coin_name.hex()}
+
+
+# ==========================================================================
+# Multi-input: same-derivation-index + cross-index (opcode-64 concurrent-spend SCC)
+# ==========================================================================
+
+class TestProcessBlockMultiInput:
+
+    @patch("coinset.subprocess.run")
+    def test_process_block_same_index_no_cycle_not_detectable(self, mock_run):
+        """Two SAME-index removals (same puzzle hash, A_sum = sp + sp) with NO
+        opcode-64 ASSERT_CONCURRENT_SPEND cycle are by-design NOT detectable.
+
+        CHIP-0057 "Scanning a Block" has a single Pass 2: same-puzzle-hash
+        multi-input sets detect ONLY when bound by the opcode-64 cycle (a CHIP MUST
+        for multi-input sends). Without the cycle the spends do not form an SCC, the
+        aggregated A_sum output is never derived, and process_block returns no match
+        for the multi-input output. There is no standalone same-puzzle-hash
+        grouping pass.
+        """
         block_height = 600
+        parent_0 = "aa" * 32
+        parent_1 = "bb" * 32
+        amount_0 = 1_000_000
+        amount_1 = 2_000_000
+        coin_0 = make_coin_name(parent_0, _s0["puzzle_hash"], amount_0)
+        coin_1 = make_coin_name(parent_1, _s0["puzzle_hash"], amount_1)
+
+        outputs = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s0["synthetic_sk"]],
+            [coin_0, coin_1],
+            [(_scan_pk, _spend_pk)],
+        )
+        _, output_ph = outputs[0]
+        output_amount = 1_500_000
+        # No opcode-64 cycle; coin 0 emits the recipient CREATE_COIN only. Under
+        # single-Pass-2 the unbound same-PH pair does not regroup -> no detection.
+        sol_0 = _create_coin_solution(output_ph, output_amount).hex()
+        sol_1 = (b"\xff\x80\xff" + bytes(Program.to((1, []))) + b"\xff\x80\x80").hex()
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_additions_and_removals":
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _multi_output_puzzle_hash.hex(),
-                                "amount": _multi_output_amount,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + coin_0.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount,
-                            },
-                            "coinbase": False,
-                        },
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info_2,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount_2,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + parent_0,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount_0}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + parent_1,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount_1}, "coinbase": False},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
+                coin_hex = _strip_0x(cmd[4])
+                sol = sol_0 if coin_hex == coin_0.hex() else sol_1
                 return mock_coinset_response({
+                    "success": True,
                     "coin_solution": {
-                        "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                        "solution": "0x80",
-                    }
+                        "puzzle_reveal": "0x" + _s0["puzzle_hex"],
+                        "solution": "0x" + sol,
+                    },
                 })
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        results = process_block(block_height, _scan_sk, _spend_pk)
+        results = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
+        matches = [r for r in results if r["puzzle_hash"] == output_ph.hex()]
+        assert len(matches) == 0, (
+            "same-PH multi-input WITHOUT an opcode-64 cycle must NOT be detected "
+            f"under the single-Pass-2 CHIP contract, got {len(matches)}"
+        )
 
-        # Pass 1 won't detect it (single-removal ECDH uses wrong key for multi-input output)
-        # Pass 2 groups the two removals, aggregates PKs, detects the output
-        multi_results = [r for r in results if r["puzzle_hash"] == _multi_output_puzzle_hash.hex()]
-        assert len(multi_results) == 1
-        assert multi_results[0]["amount"] == _multi_output_amount
-        assert multi_results[0]["block_height"] == block_height
+    @patch("coinset.subprocess.run")
+    def test_process_block_concurrent_spend_scc_two_coin_cycle(self, mock_run):
+        """Cross-index opcode-64 2-cycle (A_sum = idx0 + idx1) detected via SDK SCC."""
+        block_height = 1000
+        parent_0 = "11" * 32
+        parent_1 = "22" * 32
+        amount_0 = 1_000_000
+        amount_1 = 2_000_000
+        coin_0 = make_coin_name(parent_0, _s0["puzzle_hash"], amount_0)
+        coin_1 = make_coin_name(parent_1, _s1["puzzle_hash"], amount_1)
 
-    @patch("scanner.subprocess.run")
-    def test_scan_blocks_mixed_single_multi(self, mock_run):
-        """Block with one single-input payment and one multi-input payment: both detected."""
-        block_height = 700
+        outputs = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s1["synthetic_sk"]],
+            [coin_0, coin_1],
+            [(_scan_pk, _spend_pk)],
+        )
+        _, output_ph = outputs[0]
+        output_amount = 1_500_000
 
-        def mock_dispatcher(cmd, **kwargs):
-            command = cmd[3]
-            if command == "get_block_records":
-                return mock_coinset_response({
-                    "block_records": [
-                        {"height": block_height, "timestamp": 1700000000},
-                    ]
-                })
-            elif command == "get_additions_and_removals":
-                return mock_coinset_response({
-                    "additions": [
-                        # Single-input output (from removal at index 0 alone)
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _output_puzzle_hash.hex(),
-                                "amount": _output_amount,
-                            },
-                            "coinbase": False,
-                        },
-                        # Multi-input output (from grouped removals)
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _multi_output_puzzle_hash.hex(),
-                                "amount": _multi_output_amount,
-                            },
-                            "coinbase": False,
-                        },
-                    ],
-                    "removals": [
-                        # Removal 0: creates single-input output
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount,
-                            },
-                            "coinbase": False,
-                        },
-                        # Removal 1: part of multi-input group (same puzzle hash as removal 0)
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info_2,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount_2,
-                            },
-                            "coinbase": False,
-                        },
-                    ],
-                })
-            elif command == "get_puzzle_and_solution":
-                return mock_coinset_response({
-                    "coin_solution": {
-                        "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                        "solution": "0x80",
-                    }
-                })
-            else:
-                return mock_coinset_response({})
+        # coin 0 -> recipient CREATE_COIN + asserts coin 1; coin 1 asserts coin 0.
+        sol_0 = _create_coin_solution(output_ph, output_amount, also_op64=coin_1).hex()
+        sol_1 = _build_opcode_64_solution(coin_0).hex()
 
-        mock_run.side_effect = mock_dispatcher
-
-        detections = scan_blocks(_scan_sk, _spend_pk, start_height=700, end_height=700)
-
-        # Should detect both: single-input (Pass 1) and multi-input (Pass 2)
-        assert len(detections) >= 2
-        detected_phs = {d["puzzle_hash"] for d in detections}
-        assert _output_puzzle_hash.hex() in detected_phs
-        assert _multi_output_puzzle_hash.hex() in detected_phs
-
-    @patch("scanner.subprocess.run")
-    def test_process_block_no_duplicate_detection(self, mock_run):
-        """Single-removal detection in Pass 1 is not duplicated by Pass 2."""
-        block_height = 800
+        table = {
+            coin_0.hex(): (_s0["puzzle_hex"], sol_0),
+            coin_1.hex(): (_s1["puzzle_hex"], sol_1),
+        }
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_additions_and_removals":
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _sender_coin_name.hex(),
-                                "puzzle_hash": "0x" + _output_puzzle_hash.hex(),
-                                "amount": _output_amount,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + coin_0.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + _fake_parent_info,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": _sender_coin_amount,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + parent_0,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount_0}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + parent_1,
+                                  "puzzle_hash": "0x" + _s1["puzzle_hash"],
+                                  "amount": amount_1}, "coinbase": False},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
+                coin_hex = _strip_0x(cmd[4])
+                pz, sol = table[coin_hex]
                 return mock_coinset_response({
-                    "coin_solution": {
-                        "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                        "solution": "0x80",
-                    }
+                    "success": True,
+                    "coin_solution": {"puzzle_reveal": "0x" + pz, "solution": "0x" + sol},
                 })
-            else:
-                return mock_coinset_response({})
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        results = process_block(block_height, _scan_sk, _spend_pk)
+        results = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
+        matches = [r for r in results if r["puzzle_hash"] == output_ph.hex()]
+        assert len(matches) == 1, (
+            f"expected 1 concurrent-spend detection, got {len(matches)}: {results}"
+        )
+        assert matches[0]["amount"] == output_amount
 
-        # Should detect exactly once (Pass 1 only; Pass 2 skips groups of size < 2)
-        assert len(results) == 1
+    @patch("coinset.subprocess.run")
+    def test_process_block_concurrent_spend_pollution_defense(self, mock_run):
+        """A polluter c->a (one-way) is isolated by the directed SCC; the legit
+        a<->b output is detected, the polluted pk_a+pk_b+pk_c output is NOT.
 
-    @patch("scanner.subprocess.run")
-    def test_process_block_identity_pk_skip(self, mock_run):
-        """Two removals whose PKs sum to identity are skipped (no crash)."""
-        block_height = 900
+        Discriminator: an undirected-CC scanner would pull c into the victim group
+        and derive the polluted PH. The SDK's directed-SCC defense must not.
+        """
+        block_height = 1200
+        parent_a = "41" * 32
+        parent_b = "42" * 32
+        parent_c = "4d" * 32
+        amount_a = 1_000_000
+        amount_b = 2_000_000
+        amount_c = 5_000_000
+        coin_a = make_coin_name(parent_a, _s0["puzzle_hash"], amount_a)
+        coin_b = make_coin_name(parent_b, _s1["puzzle_hash"], amount_b)
+        coin_c = make_coin_name(parent_c, _sM["puzzle_hash"], amount_c)
 
-        # Create a puzzle whose extracted PK will be the negation of _sender_pk
-        # We need two removals with PKs that cancel. We'll use mock to return
-        # different puzzle reveals for each removal.
-        from shared import negate_g1, calculate_synthetic_public_key
+        legit_outputs = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s1["synthetic_sk"]],
+            [coin_a, coin_b],
+            [(_scan_pk, _spend_pk)],
+        )
+        _, legit_ph = legit_outputs[0]
+        polluted_outputs = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s1["synthetic_sk"], _sM["synthetic_sk"]],
+            [coin_a, coin_b, coin_c],
+            [(_scan_pk, _spend_pk)],
+        )
+        _, polluted_ph = polluted_outputs[0]
+        assert legit_ph != polluted_ph, "test setup error: pollution PH equals legit PH"
 
-        neg_pk = negate_g1(_sender_pk)
-        # Build a puzzle that curries neg_pk as the synthetic PK
-        from shared import curry, MOD
-        neg_puzzle = curry(MOD, bytes(neg_pk))
-        neg_puzzle_hex = bytes(neg_puzzle).hex()
-        neg_puzzle_hash = neg_puzzle.get_tree_hash().hex()
+        output_amount = 4_500_000
+        # legit cycle a<->b; polluter c->a (one-way).
+        sol_a = _create_coin_solution(legit_ph, output_amount, also_op64=coin_b).hex()
+        sol_b = _build_opcode_64_solution(coin_a).hex()
+        sol_c = _build_opcode_64_solution(coin_a).hex()
 
-        # Coin 1 uses _sender_puzzle (yields _sender_pk)
-        # Coin 2 uses neg_puzzle (yields neg_pk = -_sender_pk)
-        # Their sum is identity
-        fake_parent_1 = "cc" * 32
-        fake_parent_2 = "dd" * 32
-
-        coin_name_1 = make_coin_name(fake_parent_1, _sender_puzzle_hash, 100)
-        coin_name_2 = make_coin_name(fake_parent_2, neg_puzzle_hash, 200)
-
-        call_count = {"puzzle": 0}
+        table = {
+            coin_a.hex(): (_s0["puzzle_hex"], sol_a),
+            coin_b.hex(): (_s1["puzzle_hex"], sol_b),
+            coin_c.hex(): (_sM["puzzle_hex"], sol_c),
+        }
 
         def mock_dispatcher(cmd, **kwargs):
             command = cmd[3]
             if command == "get_additions_and_removals":
                 return mock_coinset_response({
                     "additions": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + coin_name_1.hex(),
-                                "puzzle_hash": "0x" + ("ee" * 32),
-                                "amount": 50,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + coin_a.hex(),
+                                  "puzzle_hash": "0x" + legit_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
                     ],
                     "removals": [
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + fake_parent_1,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": 100,
-                            },
-                            "coinbase": False,
-                        },
-                        {
-                            "coin": {
-                                "parent_coin_info": "0x" + fake_parent_2,
-                                "puzzle_hash": "0x" + _sender_puzzle_hash,
-                                "amount": 200,
-                            },
-                            "coinbase": False,
-                        },
+                        {"coin": {"parent_coin_info": "0x" + parent_a,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount_a}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + parent_b,
+                                  "puzzle_hash": "0x" + _s1["puzzle_hash"],
+                                  "amount": amount_b}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + parent_c,
+                                  "puzzle_hash": "0x" + _sM["puzzle_hash"],
+                                  "amount": amount_c}, "coinbase": False},
                     ],
                 })
             elif command == "get_puzzle_and_solution":
-                # Both removals share _sender_puzzle_hash for grouping,
-                # but we return different puzzle reveals to get different PKs.
-                # The coin_name in the args tells us which removal this is for.
-                call_count["puzzle"] += 1
-                coin_hex = cmd[4] if len(cmd) > 4 else ""
-                coin_hex_stripped = coin_hex[2:] if coin_hex.startswith("0x") else coin_hex
-                if coin_hex_stripped == coin_name_2.hex():
-                    return mock_coinset_response({
-                        "coin_solution": {
-                            "puzzle_reveal": "0x" + neg_puzzle_hex,
-                            "solution": "0x80",
-                        }
-                    })
-                else:
-                    return mock_coinset_response({
-                        "coin_solution": {
-                            "puzzle_reveal": "0x" + _sender_puzzle_hex,
-                            "solution": "0x80",
-                        }
-                    })
-            else:
-                return mock_coinset_response({})
+                coin_hex = _strip_0x(cmd[4])
+                pz, sol = table[coin_hex]
+                return mock_coinset_response({
+                    "success": True,
+                    "coin_solution": {"puzzle_reveal": "0x" + pz, "solution": "0x" + sol},
+                })
+            return mock_coinset_response({})
 
         mock_run.side_effect = mock_dispatcher
 
-        # Should not crash and should produce no detections from the identity group
-        results = process_block(block_height, _scan_sk, _spend_pk)
+        results = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
+        detected_phs = {r["puzzle_hash"] for r in results}
+        assert legit_ph.hex() in detected_phs, f"legit a<->b output not detected: {results}"
+        assert polluted_ph.hex() not in detected_phs, (
+            "polluter was aggregated into the victim group (directed-SCC defense failed)"
+        )
 
-        # Neither individual removal nor the grouped identity should detect anything
-        # (the output puzzle hash "ee"*32 isn't a valid silent payment for anyone)
-        assert isinstance(results, list)
+    @patch("coinset.subprocess.run")
+    def test_process_block_mixed_same_index_and_concurrent_spend(self, mock_run):
+        """One block with an unbound same-PH group AND an opcode-64 concurrent-spend
+        cycle group: under the single-Pass-2 CHIP contract ONLY the cycle group is
+        detected. Group A (same-PH, NO opcode-64) is by-design NOT detectable; Group
+        B (cross-index opcode-64 2-cycle) IS detected exactly once.
+        """
+        block_height = 1400
+        # Group A (same-index, same puzzle hash, NO opcode-64 -> not detectable).
+        pa0, pa1 = "c0" * 32, "c1" * 32
+        amt_a0, amt_a1 = 1_000_000, 2_000_000
+        ca0 = make_coin_name(pa0, _s0["puzzle_hash"], amt_a0)
+        ca1 = make_coin_name(pa1, _s0["puzzle_hash"], amt_a1)
+        outs_a = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s0["synthetic_sk"]], [ca0, ca1], [(_scan_pk, _spend_pk)]
+        )
+        _, group_a_ph = outs_a[0]
+
+        # Group B (concurrent-spend): two cross-index coins bound by an opcode-64
+        # 2-cycle -> detected via the single Pass-2 SCC.
+        pb0, pb1 = "d0" * 32, "d1" * 32
+        amt_b0, amt_b1 = 3_000_000, 4_000_000
+        cb0 = make_coin_name(pb0, _s1["puzzle_hash"], amt_b0)
+        cb1 = make_coin_name(pb1, _s2["puzzle_hash"], amt_b1)
+        outs_b = create_silent_payment_outputs(
+            [_s1["synthetic_sk"], _s2["synthetic_sk"]], [cb0, cb1], [(_scan_pk, _spend_pk)]
+        )
+        _, group_b_ph = outs_b[0]
+        assert group_a_ph != group_b_ph
+
+        amt_a, amt_b = 2_750_000, 3_500_000
+        sol_a0 = _create_coin_solution(group_a_ph, amt_a).hex()
+        sol_a1 = (b"\xff\x80\xff" + bytes(Program.to((1, []))) + b"\xff\x80\x80").hex()
+        sol_b0 = _create_coin_solution(group_b_ph, amt_b, also_op64=cb1).hex()
+        sol_b1 = _build_opcode_64_solution(cb0).hex()
+
+        table = {
+            ca0.hex(): (_s0["puzzle_hex"], sol_a0),
+            ca1.hex(): (_s0["puzzle_hex"], sol_a1),
+            cb0.hex(): (_s1["puzzle_hex"], sol_b0),
+            cb1.hex(): (_s2["puzzle_hex"], sol_b1),
+        }
+
+        def mock_dispatcher(cmd, **kwargs):
+            command = cmd[3]
+            if command == "get_additions_and_removals":
+                return mock_coinset_response({
+                    "additions": [
+                        {"coin": {"parent_coin_info": "0x" + ca0.hex(),
+                                  "puzzle_hash": "0x" + group_a_ph.hex(),
+                                  "amount": amt_a}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + cb0.hex(),
+                                  "puzzle_hash": "0x" + group_b_ph.hex(),
+                                  "amount": amt_b}, "coinbase": False},
+                    ],
+                    "removals": [
+                        {"coin": {"parent_coin_info": "0x" + pa0,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amt_a0}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + pa1,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amt_a1}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + pb0,
+                                  "puzzle_hash": "0x" + _s1["puzzle_hash"],
+                                  "amount": amt_b0}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + pb1,
+                                  "puzzle_hash": "0x" + _s2["puzzle_hash"],
+                                  "amount": amt_b1}, "coinbase": False},
+                    ],
+                })
+            elif command == "get_puzzle_and_solution":
+                coin_hex = _strip_0x(cmd[4])
+                pz, sol = table[coin_hex]
+                return mock_coinset_response({
+                    "success": True,
+                    "coin_solution": {"puzzle_reveal": "0x" + pz, "solution": "0x" + sol},
+                })
+            return mock_coinset_response({})
+
+        mock_run.side_effect = mock_dispatcher
+
+        results = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
+        detected_phs = {r["puzzle_hash"] for r in results}
+        # Group A (same-PH, no cycle) is NOT detectable under single-Pass-2.
+        assert group_a_ph.hex() not in detected_phs, (
+            f"unbound same-PH group A must NOT be detected (single-Pass-2): {results}"
+        )
+        # Group B (opcode-64 cycle) IS detected, exactly once.
+        assert group_b_ph.hex() in detected_phs, (
+            f"concurrent-spend group B not detected: {results}"
+        )
+        unique = {r["coin_id"] for r in results if r["puzzle_hash"] == group_b_ph.hex()}
+        assert len(unique) == 1, f"expected 1 unique concurrent-spend detection: {results}"
+
+
+# ==========================================================================
+# Sender<->scanner round-trip via the actual sender helper
+# ==========================================================================
+
+class TestSenderScannerRoundtrip:
+
+    @patch("coinset.subprocess.run")
+    def test_sender_scanner_roundtrip_two_coin_cycle(self, mock_run):
+        """A spend bundle emitted by send_payment.build_coin_spend_conditions (the
+        actual sender helper) is detected by the SDK-backed process_block's SCC path.
+
+        Fails if EITHER side breaks: a non-cyclic sender pattern won't form the SCC,
+        and a broken SDK condition walker won't extract the cycle.
+        """
+        from send_payment import build_coin_spend_conditions
+
+        block_height = 1500
+        parent_0 = "e0" * 32
+        parent_1 = "e1" * 32
+        amount_0 = 1_000_000
+        amount_1 = 2_000_000
+        coin_0 = make_coin_name(parent_0, _s0["puzzle_hash"], amount_0)
+        coin_1 = make_coin_name(parent_1, _s1["puzzle_hash"], amount_1)
+
+        outputs = create_silent_payment_outputs(
+            [_s0["synthetic_sk"], _s1["synthetic_sk"]],
+            [coin_0, coin_1],
+            [(_scan_pk, _spend_pk)],
+        )
+        _, output_ph = outputs[0]
+        output_amount = 2_500_000
+
+        sage_coins = [
+            {"parent_coin_info": parent_0, "puzzle_hash": _s0["puzzle_hash"],
+             "amount": amount_0, "coin_id": coin_0},
+            {"parent_coin_info": parent_1, "puzzle_hash": _s1["puzzle_hash"],
+             "amount": amount_1, "coin_id": coin_1},
+        ]
+        primary_outputs = [[51, output_ph, output_amount]]
+        conditions_0 = build_coin_spend_conditions(0, sage_coins, primary_outputs)
+        conditions_1 = build_coin_spend_conditions(1, sage_coins, [])
+
+        # Guard: the sender helper must emit the cyclic opcode-64 binding.
+        op64_0 = [c for c in conditions_0 if c[0] == 64]
+        op64_1 = [c for c in conditions_1 if c[0] == 64]
+        assert len(op64_0) == 1 and op64_0[0][1] == coin_1
+        assert len(op64_1) == 1 and op64_1[0][1] == coin_0
+
+        def _serialize(conds):
+            delegated = Program.to((1, conds))
+            return b"\xff\x80\xff" + bytes(delegated) + b"\xff\x80\x80"
+
+        sol_0 = _serialize(conditions_0).hex()
+        sol_1 = _serialize(conditions_1).hex()
+        table = {
+            coin_0.hex(): (_s0["puzzle_hex"], sol_0),
+            coin_1.hex(): (_s1["puzzle_hex"], sol_1),
+        }
+
+        def mock_dispatcher(cmd, **kwargs):
+            command = cmd[3]
+            if command == "get_additions_and_removals":
+                return mock_coinset_response({
+                    "additions": [
+                        {"coin": {"parent_coin_info": "0x" + coin_0.hex(),
+                                  "puzzle_hash": "0x" + output_ph.hex(),
+                                  "amount": output_amount}, "coinbase": False},
+                    ],
+                    "removals": [
+                        {"coin": {"parent_coin_info": "0x" + parent_0,
+                                  "puzzle_hash": "0x" + _s0["puzzle_hash"],
+                                  "amount": amount_0}, "coinbase": False},
+                        {"coin": {"parent_coin_info": "0x" + parent_1,
+                                  "puzzle_hash": "0x" + _s1["puzzle_hash"],
+                                  "amount": amount_1}, "coinbase": False},
+                    ],
+                })
+            elif command == "get_puzzle_and_solution":
+                coin_hex = _strip_0x(cmd[4])
+                pz, sol = table[coin_hex]
+                return mock_coinset_response({
+                    "success": True,
+                    "coin_solution": {"puzzle_reveal": "0x" + pz, "solution": "0x" + sol},
+                })
+            return mock_coinset_response({})
+
+        mock_run.side_effect = mock_dispatcher
+
+        detections = process_block(
+            block_height, _scan_sk_sdk, _spend_pk_sdk, _empty_labels()
+        )
+        matches = [d for d in detections if d["puzzle_hash"] == output_ph.hex()]
+        assert len(matches) == 1, (
+            f"sender<->scanner round-trip failed: expected 1 detection, got "
+            f"{len(matches)}; results: {detections}"
+        )
+        assert matches[0]["amount"] == output_amount
+        assert matches[0]["block_height"] == block_height

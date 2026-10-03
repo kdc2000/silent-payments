@@ -1,0 +1,38 @@
+[package]
+name = "sp-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sp-service"
+path = "src/bin/sp_service.rs"
+
+[dependencies]
+sp-common = { path = "../sp-common" }
+chia-bls = "0.41"
+chia-consensus = "0.41"
+chia-protocol = "0.41"
+chia-puzzle-types = "0.41"
+chia-puzzles = "0.20"
+chia-traits = "0.41"
+clvmr = "0.17"
+clvm-utils = "0.41"
+clvm-traits = "0.41"
+rusqlite = { version = "0.39", features = ["bundled"] }
+zstd = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+golomb-coded-set = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.29"

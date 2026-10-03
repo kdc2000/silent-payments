@@ -170,9 +170,10 @@ class TestSageSubmitTransaction:
 class TestSageAddressIntegration:
     def test_generate_address_from_sage(self):
         """Given mnemonic from get_secret_key, derive and encode silent payment address."""
-        # Key derivation runs through the SDK adapter; encode/decode are shared.py glue.
-        import sdk_adapter
         from shared import (
+            mnemonic_to_master_sk,
+            master_sk_to_scan_sk,
+            master_sk_to_spend_sk,
             encode_silent_payment_address,
             decode_silent_payment_address,
         )
@@ -180,49 +181,118 @@ class TestSageAddressIntegration:
         # Simulate Sage returning a mnemonic
         mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
-        # Derive keys as the integration would (via the SDK adapter)
-        keys = sdk_adapter.keys_from_mnemonic(mnemonic)
-        scan_pk = bytes(keys.scan_pk().to_bytes())
-        spend_pk = bytes(keys.spend_pk().to_bytes())
+        # Derive keys as the integration would
+        master_sk = mnemonic_to_master_sk(mnemonic)
+        scan_sk = master_sk_to_scan_sk(master_sk)
+        scan_pk = scan_sk.get_g1()
+        spend_sk = master_sk_to_spend_sk(master_sk)
+        spend_pk = spend_sk.get_g1()
 
         # Encode address
-        addr = encode_silent_payment_address(scan_pk, spend_pk)
+        addr = encode_silent_payment_address(bytes(scan_pk), bytes(spend_pk))
 
         # Verify prefix
         assert addr.startswith("tspxch1")
 
         # Verify round-trip
         decoded_scan, decoded_spend = decode_silent_payment_address(addr)
-        assert decoded_scan == scan_pk
-        assert decoded_spend == spend_pk
+        assert decoded_scan == bytes(scan_pk)
+        assert decoded_spend == bytes(spend_pk)
 
 
 class TestSendPaymentSpendBundle:
     """Verify the spend bundle flow uses the same coin for input_hash and spending."""
 
-    @pytest.mark.skip(
-        reason="crypto derivation + spend-bundle construction now run through the "
-        "SDK send/spend path; the same-coin-for-input_hash invariant is exercised "
-        "there, with no standalone analogue here"
-    )
     def test_spend_bundle_coin_matches_input_hash_coin(self):
-        """The coin_id used for input_hash derivation equals the coin spent in the bundle.
+        """The coin_id used for input_hash derivation equals the coin spent in the bundle."""
+        from shared import (
+            mnemonic_to_master_sk, master_sk_to_wallet_sk,
+            calculate_synthetic_secret_key,
+            compute_input_hash, compute_shared_secret_full,
+            derive_output_tweak, derive_onetime_pk_full,
+            puzzle_for_pk, puzzle_hash_for_pk,
+            decode_silent_payment_address, encode_silent_payment_address,
+            master_sk_to_scan_sk, master_sk_to_spend_sk,
+            compute_coin_id,
+            TESTNET11_GENESIS,
+        )
+        from chia_rs import Coin, CoinSpend, SpendBundle, AugSchemeMPL, Program
 
-        The silent-payment send (ECDH shared secret, output tweak, one-time pk,
-        CoinSpend + augmented AGG_SIG_ME signing) is handled by the SDK send/spend
-        path, which enforces the same-coin-for-input_hash invariant.
-        """
+        # Sender setup
+        sender_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        master_sk = mnemonic_to_master_sk(sender_mnemonic)
+        wallet_sk = master_sk_to_wallet_sk(master_sk, index=0)
+        sender_sk = calculate_synthetic_secret_key(wallet_sk)
+        sender_pk = sender_sk.get_g1()
+
+        # Fake coin data (simulating what coinset would return)
+        parent_coin_info = bytes(32)  # 32 zero bytes
+        sender_puzzle_hash = puzzle_hash_for_pk(wallet_sk.get_g1())
+        coin_amount = 1000000
+        coin_id = compute_coin_id(parent_coin_info, sender_puzzle_hash, coin_amount)
+        coin_ids = [coin_id]
+
+        # Recipient setup
+        recipient_mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong"
+        r_master = mnemonic_to_master_sk(recipient_mnemonic)
+        scan_sk = master_sk_to_scan_sk(r_master)
+        scan_pk = scan_sk.get_g1()
+        spend_sk = master_sk_to_spend_sk(r_master)
+        spend_pk = spend_sk.get_g1()
+
+        # Derive one-time address (sender side)
+        input_hash = compute_input_hash(coin_ids, sender_pk)
+        shared_secret = compute_shared_secret_full(sender_sk, scan_pk, input_hash)
+        tweak = derive_output_tweak(shared_secret, 0)
+        onetime_pk = derive_onetime_pk_full(spend_pk, tweak)
+        onetime_puzzle_hash = puzzle_hash_for_pk(onetime_pk)
+
+        # Build spend bundle (mirroring the new send_payment.py logic)
+        payment_amount = 500000
+        fee = 0
+        coin = Coin(parent_coin_info, sender_puzzle_hash, coin_amount)
+
+        # Verify the coin name matches our computed coin_id
+        assert coin.name() == coin_id, "Coin.name() must match computed coin_id"
+
+        sender_puzzle = puzzle_for_pk(wallet_sk.get_g1())
+        conditions = [[51, onetime_puzzle_hash, payment_amount]]
+        change = coin_amount - payment_amount - fee
+        if change > 0:
+            conditions.append([51, sender_puzzle_hash, change])
+
+        delegated_puzzle = Program.to((1, conditions))
+        dp_bytes = bytes(delegated_puzzle)
+        solution = Program.from_bytes_unchecked(
+            b'\xff\x80\xff' + dp_bytes + b'\xff\x80\x80'
+        )
+
+        msg = delegated_puzzle.get_tree_hash() + coin.name() + TESTNET11_GENESIS
+        sig = AugSchemeMPL.sign(sender_sk, msg)
+        coin_spend = CoinSpend(coin, sender_puzzle, solution)
+        spend_bundle = SpendBundle([coin_spend], sig)
+
+        # Key assertion: the coin spent in the bundle is the same one used for input_hash
+        bundle_json = spend_bundle.to_json_dict()
+        spent_coin = bundle_json["coin_spends"][0]["coin"]
+        # parent_coin_info in JSON is 0x-prefixed hex
+        assert spent_coin["parent_coin_info"] == "0x" + parent_coin_info.hex()
+        assert spent_coin["puzzle_hash"] == "0x" + sender_puzzle_hash.hex()
+        assert spent_coin["amount"] == coin_amount
 
     def test_spend_bundle_has_change_output(self):
         """When payment amount < coin value, change condition is included."""
-        # The sender's standard p2 puzzle hash is derived through the SDK adapter
-        # (the standard puzzle-hash-for-pk of the wallet-index pk, which synthesizes
-        # internally).
-        import sdk_adapter
+        from shared import (
+            mnemonic_to_master_sk, master_sk_to_wallet_sk,
+            calculate_synthetic_secret_key,
+            puzzle_hash_for_pk,
+        )
         from chia_rs import Program
 
         sender_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-        sender_puzzle_hash = sdk_adapter.wallet_puzzle_hash(sender_mnemonic, 0)
+        master_sk = mnemonic_to_master_sk(sender_mnemonic)
+        wallet_sk = master_sk_to_wallet_sk(master_sk, index=0)
+        sender_puzzle_hash = puzzle_hash_for_pk(wallet_sk.get_g1())
 
         # Build conditions with change
         coin_value = 1000000

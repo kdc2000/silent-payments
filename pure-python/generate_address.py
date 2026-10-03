@@ -6,29 +6,32 @@ The silent payment address consists of two BLS G1 public keys:
 - B_scan: used by senders for ECDH derivation
 - B_spend: used to derive one-time output keys
 
-Both keys are encoded in a versioned (CHIP-0057 v0) bech32m address. Share the
-address with senders -- each payment will arrive at a unique, unlinkable
-on-chain puzzle hash.
-
-The keys are derived from the mnemonic with HARDENED derivation, as CHIP-0057
-requires: scan key m/12381n/8444n/12n/0n, spend key m/12381n/8444n/13n/0n. This
-script only ever produces that address. (Addresses generated before the CHIP's
-hardened-derivation revision used unhardened derivation and are different; coins
-paid to them are reached with --legacy-keys on scan_coin.py / scanner.py /
-spend_coin.py. That flag never applies to a new address.)
+Both keys are derived from the mnemonic with hardened derivation at every
+level (scan key m/12381n/8444n/12n/0n, spend key m/12381n/8444n/13n/0n) and
+encoded in a versioned bech32m address. Share the address with senders --
+each payment will arrive at a unique, unlinkable on-chain puzzle hash.
 
 Usage:
     python generate_address.py -f keyfile.txt
     python generate_address.py "your twenty four word mnemonic ..."
     python generate_address.py                # interactive prompt
+    python generate_address.py -f keyfile.txt --label 1
+    python generate_address.py -f keyfile.txt --mainnet
     python generate_address.py --sage
     python generate_address.py --sage --fingerprint 123
 """
 
 import sys
 import argparse
-import sdk_adapter
-from shared import load_mnemonic   # mnemonic I/O glue (NOT crypto)
+from shared import (
+    mnemonic_to_master_sk,
+    master_sk_to_scan_sk,
+    master_sk_to_spend_sk,
+    encode_silent_payment_address,
+    decode_silent_payment_address,
+    generate_labeled_address,
+    load_mnemonic,
+)
 
 parser = argparse.ArgumentParser(description="Generate a silent payment address")
 parser.add_argument("mnemonic_words", nargs="*", help="Mnemonic words")
@@ -38,45 +41,52 @@ parser.add_argument("--sage-url", help="Sage RPC URL")
 parser.add_argument("--sage-cert", help="Path to Sage TLS client certificate")
 parser.add_argument("--sage-key", help="Path to Sage TLS client key")
 parser.add_argument("--fingerprint", type=int, help="Sage wallet fingerprint")
-parser.add_argument("--label", type=int, help="Label index m (e.g., 1 for donations, 2 for invoices; 0 is reserved for change)")
+parser.add_argument("--label", type=int, help="Label index m, 1 or higher (e.g., 1 for donations, 2 for invoices). "
+                                              "0 is reserved for change and is never handed out.")
+parser.add_argument("--mainnet", action="store_true", help="Print a mainnet (spxch) address instead of a testnet (tspxch) one")
 
 
-def derive_and_print_address(mnemonic: str, label: int | None = None):
-    """Derive scan/spend keys (hardened) from mnemonic and print the SP address."""
-    keys = sdk_adapter.keys_from_mnemonic(mnemonic)
-    scan_pk_hex = keys.scan_pk().to_bytes().hex()      # 48-byte compressed G1
-    spend_pk_hex = keys.spend_pk().to_bytes().hex()
+def derive_and_print_address(mnemonic: str, label: int | None = None, prefix: str = "tspxch"):
+    """Derive scan/spend keys from mnemonic and print the silent payment address."""
+    master_sk = mnemonic_to_master_sk(mnemonic)
+    scan_sk = master_sk_to_scan_sk(master_sk)
+    scan_pk = scan_sk.get_g1()
+    spend_sk = master_sk_to_spend_sk(master_sk)
+    spend_pk = spend_sk.get_g1()
 
     if label is not None:
-        addr = sdk_adapter.labeled_address(keys, label)
-        # B_m (labeled spend pk) for the print line — recover via the adapter decoder.
-        _, labeled_spend_pk = sdk_adapter.decode_silent_payment_address(addr)
-        bm_hex = labeled_spend_pk.to_bytes().hex()
+        # Refuses label 0: the change label's address is never handed out.
+        addr = generate_labeled_address(scan_sk, spend_pk, label, prefix)
+        _, labeled_spend_pk = decode_silent_payment_address(addr)
 
         print()
         print(f"=== Silent Payment Address (label {label}) ===")
         print(addr)
         print()
-        print(f"  Scan key  (B_scan):  {scan_pk_hex}")
-        print(f"  Spend key (B_spend): {spend_pk_hex}")
-        print(f"  Label key (B_m):     {bm_hex}")
+        print(f"  Scan key  (B_scan):  {bytes(scan_pk).hex()}")
+        print(f"  Spend key (B_spend): {bytes(spend_pk).hex()}")
+        print(f"  Label key (B_m):     {labeled_spend_pk.hex()}")
         print()
         print("Share this address with senders. Scan with --labels", label)
     else:
-        addr = sdk_adapter.encode_silent_payment_address(keys)
+        addr = encode_silent_payment_address(bytes(scan_pk), bytes(spend_pk), prefix)
 
         print()
         print("=== Silent Payment Address ===")
         print(addr)
         print()
-        print(f"  Scan key  (B_scan):  {scan_pk_hex}")
-        print(f"  Spend key (B_spend): {spend_pk_hex}")
+        print(f"  Scan key  (B_scan):  {bytes(scan_pk).hex()}")
+        print(f"  Spend key (B_spend): {bytes(spend_pk).hex()}")
         print()
         print("Share this address with senders.")
 
 
 def main():
     args = parser.parse_args()
+    prefix = "spxch" if args.mainnet else "tspxch"
+
+    if args.label is not None and args.label < 1:
+        parser.error("--label must be 1 or higher (0 is reserved for change and is never handed out)")
 
     if args.sage:
         # --- Sage RPC flow ---
@@ -108,16 +118,16 @@ def main():
         sage.login(fingerprint)
         secret_resp = sage.get_secret_key(fingerprint)
         mnemonic = secret_resp["secrets"]["mnemonic"]
-        derive_and_print_address(mnemonic, label=args.label)
+        derive_and_print_address(mnemonic, label=args.label, prefix=prefix)
     else:
-        # --- Backward-compatible mnemonic flow ---
+        # --- Mnemonic flow ---
         if args.mnemonic_file:
             mnemonic = load_mnemonic(["-f", args.mnemonic_file], prompt="Enter recipient mnemonic: ")
         elif args.mnemonic_words:
             mnemonic = " ".join(args.mnemonic_words)
         else:
             mnemonic = load_mnemonic([], prompt="Enter recipient mnemonic: ")
-        derive_and_print_address(mnemonic, label=args.label)
+        derive_and_print_address(mnemonic, label=args.label, prefix=prefix)
 
 
 if __name__ == "__main__":

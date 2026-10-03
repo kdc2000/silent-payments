@@ -1,0 +1,27 @@
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtualenvs
+venv/
+.venv/
+
+# Rust build output
+target/
+
+# Local clone of the SDK source (see BUILD.md)
+/chia-wallet-sdk/
+
+# Key material: mnemonic / key files must never be committed
+keyfile.txt
+mnemonic.txt
+*.mnemonic
+*.key
+*_wallet
+
+# Local databases written by the Rust service and client
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
