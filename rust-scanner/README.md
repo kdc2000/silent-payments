@@ -103,6 +103,15 @@ coins created by its spends.
 - The change label (`m = 0`) is always scanned for; `--max-labels N` adds the
   labels `1..=N`. The scan stops at `K_max = 2400` outputs per spend group.
 
+## Measuring tweak data on mainnet
+
+`sp_measure` (in `crates/sp-service`) walks a height range of a synced full node's
+database, read-only, and writes one CSV row per transaction block: eligible spends,
+multi-input groups, the length of the tweak list, additions and distinct puzzle
+hashes, and the size of the transactions filter and of the header block. It can also
+time the client's per-tweak-point work. The output of a run on 2026-10-03 is in
+[`measurements/`](measurements/README.md).
+
 ## Limitations
 
 - **Chain reorganisations are not handled.** Neither the service's index nor

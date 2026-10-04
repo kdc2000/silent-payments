@@ -1,0 +1,14 @@
+start=9200000
+end_exclusive=9200300
+db_peak=9381465
+heights_read=300
+heights_missing=0
+non_transaction_blocks=197
+transaction_blocks=103
+generator_errors=0
+filter_hash_mismatches=0
+scc_disagreements=0
+cut_through=false
+cut_through_single_coin_fallback_unspent=0
+elapsed_seconds=12.3
+heights_per_second=24.4

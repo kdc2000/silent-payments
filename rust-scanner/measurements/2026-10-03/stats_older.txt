@@ -1,0 +1,86 @@
+==============================================================================
+window_1y_7680000_7685000.csv
+heights [7680000, 7685000)  read 5000  missing 0  non-tx 3212  tx 1788  gen errors 0  filter mismatches 0  scc disagreements 0
+time 2025-09-29 11:39 .. 2025-09-30 13:08 UTC; observed 4703 heights/day (1.06 days); walk 41.7 s at 120.0 heights/s
+tx-block share: 35.76% (1788 of 5000)
+  removals             mean 28.0  median 17  p95 104  max 486
+  eligible             mean 13.0  median 4  p95 42  max 420
+  tweaks               mean 13.0  median 4  p95 42  max 424
+  additions_tx         mean 30.0  median 16  p95 67  max 1309
+  distinct_ph_all      mean 29.3  median 17  p95 57  max 1312
+  filter_n             mean 57.3  median 36  p95 168  max 1331
+  filter_bytes         mean 155.9  median 98  p95 455  max 3594
+  header_with_filter   mean 5881.2  median 5431  p95 9335  max 19828
+  header_no_filter     mean 5726.3  median 5311  p95 9015  max 19561
+  H_b (hdr - filter)   mean 5725.3  median 5310  p95 9014  max 19560
+blocks with >=1 tweak point: 1634 (91.39% of tx blocks, 32.68% of heights)
+  [tweak blocks] tweaks               mean 14.3  median 5  p95 51  max 424
+  [tweak blocks] filter_n             mean 61.2  median 38  p95 173  max 1331
+  [tweak blocks] filter_bytes         mean 166.4  median 104  p95 468  max 3594
+  [tweak blocks] header_with_filter   mean 5966.6  median 5511  p95 9564  max 19828
+  [tweak blocks] header_no_filter     mean 5801.2  median 5337  p95 9326  max 19561
+  [tweak blocks] H_b (hdr - filter)   mean 5800.2  median 5336  p95 9325  max 19560
+removals 50061  eligible 23216  eligible share 46.38%
+tweak points 23315  from multi-input groups 99 (0.425%)  blocks with a multi-input group 90 (5.03% of tx blocks)
+multi-input groups 99  largest 100  groups emitted 23315  dropped single 0  dropped multi 0  duplicates removed 0
+>100 distinct addition puzzle hashes: 2.74% of tx blocks (49), 2.82% of blocks with tweak points (46), holding 6.61% of tweak points
+>50 distinct addition puzzle hashes: 5.43% of tx blocks (97), 5.69% of blocks with tweak points (93), holding 9.94% of tweak points
+filter bytes per element: 2.721 (sum bytes 278810 / sum N 102457)
+blocks with tweaks > floor(3N/2): 0
+max tweak list 424 = 3.08% of MAX_TWEAKS_PER_BLOCK (13749); headroom factor 32.4x; max cost 3330195826 (30.3% of 11e9)
+  block with max tweaks: height 7680786 removals 486 eligible 420 cost 1511229826
+bandwidth per day at 4608 heights/day (derived):
+  tweak points          1091.6 kB/day     32.75 MB/30d   (+41 B x 2 responses in window)
+  headers+filter        8985.1 kB/day    269.55 MB/30d   (of which filters 250.6 kB/day; headers alone 8734.5 kB/day)
+  sum                  10076.7 kB/day    302.30 MB/30d
+  (headers without filter for the same blocks: 8736.0 kB/day)
+  tweak points/day 21487; blocks with tweak points/day 1506; tx blocks/day 1648
+cut-through (omit_spent, peak 9381363): 21982 of 23315 tweak points omitted (94.28%); blocks left with none: 730 of 1634; -1 fallbacks 0
+  with omit_spent: tweaks 92.3 kB/day, headers+filter 5160.0 kB/day, sum 5252.3 kB/day
+server-side time per tx block (this machine): generator 2.8 ms mean, group_spends 13.7 ms mean
+  CPU   0 labels: 858.8 us/point -> 18.45 s per day of chain, 553.6 s (9.23 min) per 30 d, 112.3 min per year
+  CPU  10 labels: 2872.2 us/point -> 61.72 s per day of chain, 1851.5 s (30.86 min) per 30 d, 375.4 min per year
+  CPU 100 labels: 21137.0 us/point -> 454.17 s per day of chain, 13625.2 s (227.09 min) per 30 d, 2762.9 min per year
+==============================================================================
+window_2y_6000000_6005000.csv
+heights [6000000, 6005000)  read 5000  missing 0  non-tx 3186  tx 1814  gen errors 0  filter mismatches 0  scc disagreements 0
+time 2024-09-30 04:49 .. 2024-10-01 06:56 UTC; observed 4596 heights/day (1.09 days); walk 38.2 s at 130.8 heights/s
+tx-block share: 36.28% (1814 of 5000)
+  removals             mean 23.5  median 7  p95 85  max 1311
+  eligible             mean 16.1  median 2  p95 46  max 1311
+  tweaks               mean 16.1  median 2  p95 46  max 1311
+  additions_tx         mean 41.2  median 8  p95 107  max 2154
+  distinct_ph_all      mean 42.4  median 11  p95 86  max 2156
+  filter_n             mean 66.0  median 22  p95 191  max 2163
+  filter_bytes         mean 179.3  median 60  p95 517  max 5837
+  header_with_filter   mean 5813.5  median 5365  p95 9419  max 16951
+  header_no_filter     mean 5635.2  median 5205  p95 9009  max 16735
+  H_b (hdr - filter)   mean 5634.2  median 5204  p95 9008  max 16734
+blocks with >=1 tweak point: 1387 (76.46% of tx blocks, 27.74% of heights)
+  [tweak blocks] tweaks               mean 21.1  median 4  p95 62  max 1311
+  [tweak blocks] filter_n             mean 84.0  median 30  p95 227  max 2163
+  [tweak blocks] filter_bytes         mean 228.1  median 82  p95 613  max 5837
+  [tweak blocks] header_with_filter   mean 6003.8  median 5533  p95 9762  max 16951
+  [tweak blocks] header_no_filter     mean 5776.7  median 5343  p95 9291  max 16735
+  [tweak blocks] H_b (hdr - filter)   mean 5775.7  median 5342  p95 9290  max 16734
+removals 42707  eligible 29288  eligible share 68.58%
+tweak points 29288  from multi-input groups 0 (0.000%)  blocks with a multi-input group 0 (0.00% of tx blocks)
+multi-input groups 0  largest 0  groups emitted 29288  dropped single 0  dropped multi 0  duplicates removed 0
+>100 distinct addition puzzle hashes: 4.36% of tx blocks (79), 5.62% of blocks with tweak points (78), holding 4.71% of tweak points
+>50 distinct addition puzzle hashes: 8.93% of tx blocks (162), 11.61% of blocks with tweak points (161), holding 9.45% of tweak points
+filter bytes per element: 2.719 (sum bytes 325246 / sum N 119634)
+blocks with tweaks > floor(3N/2): 0
+max tweak list 1311 = 9.54% of MAX_TWEAKS_PER_BLOCK (13749); headroom factor 10.5x; max cost 5435540979 (49.4% of 11e9)
+  block with max tweaks: height 6001059 removals 1311 eligible 1311 cost 2265167562
+bandwidth per day at 4608 heights/day (derived):
+  tweak points          1346.7 kB/day     40.40 MB/30d   (+41 B x 2 responses in window)
+  headers+filter        7674.4 kB/day    230.23 MB/30d   (of which filters 291.6 kB/day; headers alone 7382.9 kB/day)
+  sum                   9021.2 kB/day    270.63 MB/30d
+  (headers without filter for the same blocks: 7384.2 kB/day)
+  tweak points/day 26992; blocks with tweak points/day 1278; tx blocks/day 1672
+cut-through (omit_spent, peak 9381360): 28076 of 29288 tweak points omitted (95.86%); blocks left with none: 540 of 1387; -1 fallbacks 0
+  with omit_spent: tweaks 84.8 kB/day, headers+filter 4784.4 kB/day, sum 4869.2 kB/day
+server-side time per tx block (this machine): generator 1.4 ms mean, group_spends 11.8 ms mean
+  CPU   0 labels: 858.8 us/point -> 23.18 s per day of chain, 695.4 s (11.59 min) per 30 d, 141.0 min per year
+  CPU  10 labels: 2872.2 us/point -> 77.53 s per day of chain, 2325.8 s (38.76 min) per 30 d, 471.6 min per year
+  CPU 100 labels: 21137.0 us/point -> 570.53 s per day of chain, 17115.8 s (285.26 min) per 30 d, 3470.7 min per year

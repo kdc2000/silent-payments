@@ -123,7 +123,8 @@ impl ChiaBlockReader {
             let params: Vec<&[u8]> = chunk.iter().map(|c| c.as_slice()).collect();
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
                 let name: Vec<u8> = row.get(0)?;
-                let spent_index: u32 = row.get(1)?;
+                // The node stores 0 (and, in newer databases, -1) for an unspent coin.
+                let spent_index: i64 = row.get(1)?;
                 Ok((name, spent_index))
             })?;
 
@@ -133,7 +134,7 @@ impl ChiaBlockReader {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&name);
                     if spent_index > 0 {
-                        result.insert(arr, Some(spent_index));
+                        result.insert(arr, Some(spent_index as u32));
                     } else {
                         result.insert(arr, None);
                     }

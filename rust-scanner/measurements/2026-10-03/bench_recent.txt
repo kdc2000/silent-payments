@@ -1,0 +1,10 @@
+tweak points in file: 120893, sampled: 4000 (stride 30)
+decode+subgroup check:                104.1 us/point (median 106.7)
+b_scan*T + SHA-256:                   160.1 us/point (median 161.3)
+full step 4,   0 labels (  2 candidates):     837.2 us/point (median 858.8), hits 0
+full step 4,  10 labels ( 12 candidates):    2861.2 us/point (median 2872.2), hits 0
+full step 4, 100 labels (102 candidates):   21017.4 us/point (median 21137.0), hits 0
+SipHash-2-4 + range of one 32-byte candidate: 0.030 us
+filter decode, N =   100: 271 bytes, 4.4 us per filter (0.044 us/element), round trip ok
+filter decode, N =  1000: 2700 bytes, 46.4 us per filter (0.046 us/element), round trip ok
+filter decode, N =  5000: 13491 bytes, 237.4 us per filter (0.047 us/element), round trip ok
